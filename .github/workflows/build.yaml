@@ -1,0 +1,47 @@
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build variant"
+        type: choice
+        options:
+          - vanilla
+          - finasu
+          - finasu-susfs
+        default: vanilla
+      opts:
+        description: "Config layer"
+        type: choice
+        options:
+          - "off"
+          - smooth
+          - battery
+        default: "off"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Build kernel
+        env:
+          VARIANT: ${{ inputs.variant }}
+          OPTS: ${{ inputs.opts }}
+        run: bash scripts/build-kernel.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odin-kernel-${{ inputs.variant }}-${{ inputs.opts }}
+          path: out/
+          if-no-files-found: warn
