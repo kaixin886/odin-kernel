@@ -14,9 +14,13 @@ on:
           - finasu-susfs
         default: vanilla
       opts:
-        description: "Smoothness config layer"
-        type: boolean
-        default: false
+        description: "Config layer"
+        type: choice
+        options:
+          - "off"
+          - smooth
+          - battery
+        default: "off"
 
 jobs:
   build:
@@ -33,13 +37,13 @@ jobs:
       - name: Build kernel
         env:
           VARIANT: ${{ inputs.variant }}
-          OPTS: ${{ inputs.opts && '1' || '0' }}
+          OPTS: ${{ inputs.opts }}
         run: bash scripts/build-kernel.sh
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: odin-kernel-${{ inputs.variant }}-opts${{ inputs.opts }}
+          name: odin-kernel-${{ inputs.variant }}-${{ inputs.opts }}
           path: out/
           if-no-files-found: warn

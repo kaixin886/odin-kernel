@@ -3,15 +3,21 @@
 #
 # Environment inputs:
 #   VARIANT     vanilla | finasu | finasu-susfs   (default: vanilla)
-#   OPTS        0 | 1                             (default: 0) smoothness config layer
+#   OPTS        off | smooth | battery            (default: off) config layer
 #   FINASU_REF  FinaSU git tag to integrate       (default: v1.3.2)
 #
 # Outputs land in ./out : Image, .config, utsrelease.txt, SHA256SUMS.
 set -euo pipefail
 
 VARIANT="${VARIANT:-vanilla}"
-OPTS="${OPTS:-0}"
+OPTS="${OPTS:-off}"
 FINASU_REF="${FINASU_REF:-v1.3.2}"
+
+# Backwards-compatible aliases for the old boolean switch.
+case "$OPTS" in
+  1) OPTS=smooth ;;
+  0) OPTS=off ;;
+esac
 
 ROOT="$(pwd)"
 WORK="$ROOT/work"
@@ -141,15 +147,20 @@ if [ "$VARIANT" != "vanilla" ]; then
     --enable EXT4_FS --enable HEADERS_INSTALL
 fi
 
-if [ "$OPTS" = "1" ]; then
+if [ "$OPTS" = "smooth" ]; then
   step "apply smoothness config layer"
   "$KSRC/scripts/config" --file "$CFG" \
     --disable HZ_250 --enable HZ_1000 \
     --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC
+elif [ "$OPTS" = "battery" ]; then
+  step "apply battery config layer (tick stays at 250 Hz)"
+  "$KSRC/scripts/config" --file "$CFG" \
+    --enable WQ_POWER_EFFICIENT_DEFAULT \
+    --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC
 fi
 
 make "${MAKE_ARGS[@]}" olddefconfig
-grep -E '^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|HZ)=' "$CFG" || true
+grep -E '^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|HZ|WQ_POWER_EFFICIENT_DEFAULT)=' "$CFG" || true
 
 # ---------------------------------------------------------------- build
 step "build Image"
