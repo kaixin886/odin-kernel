@@ -1,0 +1,45 @@
+# Copy this file to .github/workflows/build.yml in the repo
+# (the assistant cannot push workflow files; it must be pasted by hand).
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build variant"
+        type: choice
+        options:
+          - vanilla
+          - finasu
+          - finasu-susfs
+        default: vanilla
+      opts:
+        description: "Smoothness config layer"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Build kernel
+        env:
+          VARIANT: ${{ inputs.variant }}
+          OPTS: ${{ inputs.opts && '1' || '0' }}
+        run: bash scripts/build-kernel.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odin-kernel-${{ inputs.variant }}-opts${{ inputs.opts }}
+          path: out/
+          if-no-files-found: warn
