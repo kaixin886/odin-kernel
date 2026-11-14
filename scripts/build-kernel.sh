@@ -862,27 +862,30 @@ PYEOF
   fi
 
   # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at the
-  # Mi logo on real hardware while vanilla booted. BISECT1 (whole invasive
-  # hook cluster off) BOOTED - KSU core is clean. BISECT2 (syscall pair
-  # restored, SELinux pair still off) HUNG again - the poison is in the
-  # syscall pair. BISECT3 (dispatcher install ON, hook manager OFF,
-  # SELinux pair off) BOOTED - the sys_call_table patch / ni-slot search /
-  # symbol resolution are innocent; the poison is inside
-  # ksu_syscall_hook_manager_init. Review of that function: the hook
-  # registrations are inert table writes, the sucompat/setuid/umount
-  # inits only register feature handlers, and the dispatcher itself is
-  # well guarded against spurious/self calls. Two heavy pieces remain:
-  # (A) the kretprobes on syscall_regfunc/syscall_unregfunc with the
-  # tp_marker process-marking inside their handlers, and (C) the
-  # sys_enter tracepoint whose handler redirects execve & friends into
-  # the dispatcher at runtime.
-  # BISECT4: manager fully ON but the sys_enter tracepoint registration
-  # is skipped (handler never fires, no redirection happens); SELinux
-  # pair still OFF. Boots -> (C) the redirect execution chain is the
-  # killer. Hangs -> (A) the kretprobe/tp_marker machinery is.
+  # Mi logo on real hardware while vanilla booted. BISECT1 (whole hook
+  # cluster off) BOOTED - KSU core clean. BISECT2 (syscall pair on,
+  # SELinux pair off) HUNG. BISECT3 (dispatcher install on, manager off)
+  # BOOTED - the table patch is innocent; poison inside the manager.
+  # BISECT4 (manager on, sys_enter tracepoint registration skipped)
+  # BOOTED - registering the hooks is fine; activating the sys_enter
+  # probe is the fatal step. Two coupled suspects remain: (A) the
+  # kretprobes on syscall_regfunc/syscall_unregfunc, whose handlers run
+  # tp_marker process-marking (tasklist walk, per-task cred + SELinux
+  # domain checks) in kretprobe-return context the moment our own probe
+  # registration makes the kernel call syscall_regfunc - during the
+  # initcall, with SELinux policy not yet loaded; and (C) the redirect
+  # execution itself (handler rewrites regs, dispatcher runs the
+  # sucompat hooks, which call the originals through the table).
+  # BISECT5: manager fully ON with tracepoint registration restored, but
+  # the kretprobe pair is not registered. The kernel's own regfunc still
+  # marks all tasks (and the flag is inherited on clone), so redirect
+  # coverage is unaffected in practice; the pair only maintains marking
+  # granularity when third-party tracers come and go. Boots -> (A) is
+  # the poison and this removal is the fix. Hangs -> (C) is, and the
+  # sucompat hooks themselves need 5.4 surgery.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
-  if ! grep -q 'bisect4-off' "$INIT_C"; then
+  if ! grep -q 'bisect5-off' "$INIT_C"; then
     python3 - "$INIT_C" "$MGR_C" <<'PYEOF'
 import sys
 init_path, mgr_path = sys.argv[1], sys.argv[2]
@@ -896,16 +899,18 @@ def rep(src, old, new, expect=1):
 
 src = open(init_path).read()
 src = rep(src, "    ksu_selinux_hide_init();",
-    "    /* bisect4-off: ksu_selinux_hide_init(); */")
+    "    /* bisect5-off: ksu_selinux_hide_init(); */")
 src = rep(src, "    ksu_avc_spoof_init();",
-    "    /* bisect4-off: ksu_avc_spoof_init(); */")
+    "    /* bisect5-off: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
 
 src = open(mgr_path).read()
-src = rep(src, "    ret = register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN);",
-    "    ret = 0; /* bisect4-off: register_trace_prio_sys_enter skipped */")
+src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
+    "    syscall_regfunc_rp = NULL; /* bisect5-off: kretprobe pair not registered */")
+src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
+    "    syscall_unregfunc_rp = NULL; /* bisect5-off: kretprobe pair not registered */")
 open(mgr_path, "w").write(src)
-print("patched: bisect4 - manager on, sys_enter tp skipped, selinux pair off")
+print("patched: bisect5 - kretprobe pair removed, tp redirect active, selinux pair off")
 PYEOF
   fi
 fi
