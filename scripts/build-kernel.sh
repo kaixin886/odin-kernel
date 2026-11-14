@@ -48,13 +48,18 @@ step "fetch AOSP clang ($CLANG_WANT preferred)"
 TOOLBIN="$WORK/toolchain/bin"
 mkdir -p "$TOOLBIN"
 CLANG_HOME=""
-if git clone --depth 1 --filter=blob:none --sparse \
+# Pin the Android 17 release tag: its tree carries clang-r574158, the exact
+# toolchain Inkypen recorded in odin_defconfig. The default branch has
+# already pruned that directory and only ships much newer clangs.
+if git clone --depth 1 --filter=blob:none --sparse --branch android-17.0.0_r1 \
       https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
       "$WORK/clang-prebuilts" 2>"$WORK/clang-clone.log"; then
   cd "$WORK/clang-prebuilts"
-  PICK="$(git ls-tree --name-only HEAD | grep -E '^clang-r[0-9]+$' | sort -V | grep -x "$CLANG_WANT" || true)"
-  if [ -z "$PICK" ]; then
-    PICK="$(git ls-tree --name-only HEAD | grep -E '^clang-r[0-9]+$' | sort -V | tail -1 || true)"
+  mapfile -t ALL_DIRS < <(git ls-tree --name-only HEAD | grep -E '^clang-r[0-9]+$' | sort -V)
+  echo "available clang dirs: ${ALL_DIRS[*]:-none}"
+  PICK="$(printf '%s\n' "${ALL_DIRS[@]}" | grep -x "$CLANG_WANT" || true)"
+  if [ -z "$PICK" ] && [ "${#ALL_DIRS[@]}" -gt 0 ]; then
+    PICK="${ALL_DIRS[-1]}"
   fi
   if [ -n "$PICK" ]; then
     echo "sparse-checkout $PICK"
@@ -74,11 +79,18 @@ if [ -z "$CLANG_HOME" ] || [ ! -x "$CLANG_HOME/bin/clang" ]; then
   CLANG_HOME="/usr/lib/llvm-21"
 fi
 
-for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-as; do
-  src="$CLANG_HOME/bin/$t"
-  [ -x "$src" ] || src="$(command -v "$t-21" || true)"
-  [ -n "$src" ] && ln -sf "$src" "$TOOLBIN/$t"
+# AOSP clang ships `clang` as a wrapper that execs a sibling `clang-real`;
+# link the whole bin directory so every sibling stays resolvable.
+for f in "$CLANG_HOME/bin/"*; do
+  [ -e "$f" ] && ln -sf "$f" "$TOOLBIN/$(basename "$f")"
 done
+# apt.llvm.org fallback installs versioned names only; add plain aliases.
+if [ ! -e "$TOOLBIN/clang" ]; then
+  for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-as; do
+    src="$(command -v "$t-21" || true)"
+    [ -n "$src" ] && ln -sf "$src" "$TOOLBIN/$t"
+  done
+fi
 export PATH="$TOOLBIN:$PATH"
 clang --version | head -2
 
