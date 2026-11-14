@@ -147,6 +147,18 @@ for a in rel.get("assets", []):
   EXTRA_MAKE_VARS+=(KSU_EXPECTED_SIZE="$KSU_SIZE" KSU_EXPECTED_HASH="$KSU_HASH" KSU_REQUIRE_PREINIT=1)
 fi
 
+if [ "$VARIANT" != "vanilla" ]; then
+  step "5.4 compatibility patches"
+  # include/linux/pgtable.h exists only since 5.10; on 5.4 the definitions
+  # live in asm/pgtable.h. sucompat.c uses no pgtable symbols (the include
+  # is vestigial there) but it is unguarded, so retarget it for this tree.
+  SUCOMPAT="$KSRC/drivers/kernelsu/feature/sucompat.c"
+  if grep -q '#include <linux/pgtable\.h>' "$SUCOMPAT"; then
+    sed -i 's|#include <linux/pgtable\.h>|#include <asm/pgtable.h>|' "$SUCOMPAT"
+    echo "patched: sucompat.c linux/pgtable.h -> asm/pgtable.h"
+  fi
+fi
+
 # ---------------------------------------------------------------- config
 step "configure (odin_defconfig)"
 make "${MAKE_ARGS[@]}" odin_defconfig
