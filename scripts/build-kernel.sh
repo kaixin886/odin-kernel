@@ -216,6 +216,287 @@ open(path, "w").write(src)
 print("patched: pkg_observer.c handle_inode_event -> handle_event (5.4)")
 PYEOF
   fi
+
+  # 5.4-5.9 have no struct selinux_policy (it arrived in 5.10): the
+  # policydb/sidtab/latest_granting live directly in struct selinux_ss,
+  # and selinux_state has no .policy pointer or .policy_mutex. #8 died
+  # in drivers/kernelsu/selinux/rules.c on exactly that. Provide a shim
+  # struct plus 5.4 install paths that mirror security_load_policy()'s
+  # own swap (policydb struct copy under the ss policy_rwlock write
+  # lock). The status page/lock moved out of selinux_ss a step
+  # earlier, in 5.7, so that retarget is guarded separately.
+  SEPOLICY_H="$KSRC/drivers/kernelsu/selinux/sepolicy.h"
+  RULES_C="$KSRC/drivers/kernelsu/selinux/rules.c"
+  HIDE_C="$KSRC/drivers/kernelsu/feature/selinux_hide.c"
+
+  if ! grep -q 'Mirror the 5.10+ layout' "$SEPOLICY_H"; then
+    python3 - "$SEPOLICY_H" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+if src.count("#endif") != 1:
+    print("ERROR: sepolicy.h: expected exactly 1 #endif", file=sys.stderr)
+    sys.exit(1)
+shim = '''#include <linux/version.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+/* 5.4-5.9 have no struct selinux_policy (it arrived in 5.10): the
+ * policydb, sidtab and latest_granting live directly in struct
+ * selinux_ss, and selinux_state has no .policy pointer or .policy_mutex.
+ * Mirror the 5.10+ layout so ksu_dup_sepolicy() and the rule code keep
+ * working on a stack-built view of the live policy. */
+struct selinux_policy {
+    struct sidtab *sidtab;
+    struct policydb policydb;
+    u32 latest_granting;
+};
+#endif
+
+#endif'''
+src = src.replace("#endif", shim, 1)
+open(path, "w").write(src)
+print("patched: sepolicy.h + struct selinux_policy shim (5.4-5.9)")
+PYEOF
+  fi
+
+  if ! grep -q '5.4-5.9: no selinux_state.policy' "$RULES_C"; then
+    python3 - "$RULES_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: rules.c: expected {expect} match, found {n} for {old[:60]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep('''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+
+    if (!getenforce()) {''',
+'''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+    /* 5.4-5.9: the live policy has no heap object; snapshot it here. */
+    struct selinux_policy live_view;
+#endif
+
+    if (!getenforce()) {''')
+
+rep('''    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+    backup_sepolicy = ksu_dup_sepolicy(old_pol);''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+#else
+    /* 5.4-5.9: no selinux_state.policy/policy_mutex. Snapshot the live
+     * policy (plain struct copy, no allocation) under the ss write
+     * lock, then dup/modify the snapshot outside the lock. A policy
+     * reload racing this window would free the snapshotted tables, but
+     * nothing reloads policy after boot on Android. */
+    write_lock_irq(&selinux_state.ss->policy_rwlock);
+    live_view.sidtab = selinux_state.ss->sidtab;
+    live_view.latest_granting = selinux_state.ss->latest_granting;
+    memcpy(&live_view.policydb, &selinux_state.ss->policydb, sizeof(live_view.policydb));
+    write_unlock_irq(&selinux_state.ss->policy_rwlock);
+    old_pol = &live_view;
+#endif
+    backup_sepolicy = ksu_dup_sepolicy(old_pol);''')
+
+rep('''    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+
+    reset_avc_cache();
+#ifdef CONFIG_KSU_SUSFS
+    susfs_set_batch_sid();
+#endif
+out_unlock:
+    mutex_unlock(&selinux_state.policy_mutex);
+}''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+#else
+    /* Install like security_load_policy(): struct-copy the new policydb
+     * over the live one under the ss write lock, then destroy the old
+     * tables (still referenced by the snapshot) after the swap. Free
+     * only the new pol struct shell: its tables are now live, and the
+     * sidtab pointer is unchanged (the dup aliases it). */
+    write_lock_irq(&selinux_state.ss->policy_rwlock);
+    memcpy(&selinux_state.ss->policydb, &pol->policydb, sizeof(selinux_state.ss->policydb));
+    selinux_state.ss->latest_granting++;
+    write_unlock_irq(&selinux_state.ss->policy_rwlock);
+    policydb_destroy(&live_view.policydb);
+    kfree(pol);
+#endif
+
+    reset_avc_cache();
+#ifdef CONFIG_KSU_SUSFS
+    susfs_set_batch_sid();
+#endif
+out_unlock:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    mutex_unlock(&selinux_state.policy_mutex);
+#endif
+}''')
+
+rep('''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+    struct sepol_batch_cursor cursor;''',
+'''    struct selinux_policy *pol, *old_pol;
+    struct policydb *db;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+    /* 5.4-5.9: the live policy has no heap object; snapshot it here. */
+    struct selinux_policy live_view;
+#endif
+    struct sepol_batch_cursor cursor;''')
+
+rep('''    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+    pol = ksu_dup_sepolicy(old_pol);''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    mutex_lock(&selinux_state.policy_mutex);
+
+    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+#else
+    /* 5.4-5.9: no selinux_state.policy/policy_mutex; see apply_kernelsu_rules(). */
+    write_lock_irq(&selinux_state.ss->policy_rwlock);
+    live_view.sidtab = selinux_state.ss->sidtab;
+    live_view.latest_granting = selinux_state.ss->latest_granting;
+    memcpy(&live_view.policydb, &selinux_state.ss->policydb, sizeof(live_view.policydb));
+    write_unlock_irq(&selinux_state.ss->policy_rwlock);
+    old_pol = &live_view;
+#endif
+    pol = ksu_dup_sepolicy(old_pol);''')
+
+rep('''    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+
+    reset_avc_cache();
+#ifdef CONFIG_KSU_SUSFS
+    susfs_set_batch_sid();
+#endif
+    ret = success_cmd_count;
+    goto out_unlock;
+
+out_drop_new_policy:
+    ksu_destroy_sepolicy(pol);
+out_unlock:
+    mutex_unlock(&selinux_state.policy_mutex);''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    rcu_assign_pointer(selinux_state.policy, pol);
+    synchronize_rcu();
+    ksu_destroy_sepolicy(old_pol);
+#else
+    /* Install like security_load_policy(); see apply_kernelsu_rules(). */
+    write_lock_irq(&selinux_state.ss->policy_rwlock);
+    memcpy(&selinux_state.ss->policydb, &pol->policydb, sizeof(selinux_state.ss->policydb));
+    selinux_state.ss->latest_granting++;
+    write_unlock_irq(&selinux_state.ss->policy_rwlock);
+    policydb_destroy(&live_view.policydb);
+    kfree(pol);
+#endif
+
+    reset_avc_cache();
+#ifdef CONFIG_KSU_SUSFS
+    susfs_set_batch_sid();
+#endif
+    ret = success_cmd_count;
+    goto out_unlock;
+
+out_drop_new_policy:
+    ksu_destroy_sepolicy(pol);
+out_unlock:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    mutex_unlock(&selinux_state.policy_mutex);
+#endif''')
+
+open(path, "w").write(src)
+print("patched: rules.c selinux_state.policy -> 5.4 ss snapshot/swap (x2)")
+PYEOF
+  fi
+
+  if ! grep -q '#include <linux/spinlock.h>' "$RULES_C"; then
+    sed -i 's|#include <linux/lockdep.h>|&\n#include <linux/spinlock.h>|' "$RULES_C"
+    echo "patched: rules.c + linux/spinlock.h (write_lock_irq)"
+  fi
+
+  if ! grep -q 'ksu_selinux_status_lock' "$HIDE_C"; then
+    python3 - "$HIDE_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: selinux_hide.c: expected {expect} match, found {n} for {old[:60]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep('''#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+#define ksu_task_security_struct task_security_struct
+#else
+#define ksu_task_security_struct cred_security_struct
+#endif''',
+'''#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+#define ksu_task_security_struct task_security_struct
+#else
+#define ksu_task_security_struct cred_security_struct
+#endif
+
+/* 5.4-5.6 keep the SELinux status page/lock in struct selinux_ss; 5.7+
+ * moved them into struct selinux_state. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+#define ksu_selinux_status_lock (&selinux_state.status_lock)
+#define ksu_selinux_status_page (selinux_state.status_page)
+#else
+#define ksu_selinux_status_lock (&selinux_state.ss->status_lock)
+#define ksu_selinux_status_page (selinux_state.ss->status_page)
+#endif''')
+
+rep("mutex_lock(&selinux_state.status_lock);",
+    "mutex_lock(ksu_selinux_status_lock);", expect=2)
+rep("mutex_unlock(&selinux_state.status_lock);",
+    "mutex_unlock(ksu_selinux_status_lock);", expect=2)
+rep("if (!selinux_state.status_page) {",
+    "if (!ksu_selinux_status_page) {")
+rep("struct selinux_kernel_status *status = page_address(selinux_state.status_page);",
+    "struct selinux_kernel_status *status = page_address(ksu_selinux_status_page);")
+
+rep('''    struct selinux_policy *orig_policy;''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    struct selinux_policy *orig_policy;
+#endif''')
+
+rep('''    orig_policy = rcu_dereference(selinux_state.policy);
+    orig_policydb = &orig_policy->policydb;
+    orig_sidtab = orig_policy->sidtab;''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    orig_policy = rcu_dereference(selinux_state.policy);
+    orig_policydb = &orig_policy->policydb;
+    orig_sidtab = orig_policy->sidtab;
+#else
+    /* 5.4-5.9: no selinux_state.policy; the live policy is selinux_state.ss. */
+    orig_policydb = &selinux_state.ss->policydb;
+    orig_sidtab = selinux_state.ss->sidtab;
+#endif''')
+
+open(path, "w").write(src)
+print("patched: selinux_hide.c status page/lock + live policy -> 5.4 ss")
+PYEOF
+  fi
 fi
 
 # ---------------------------------------------------------------- config
