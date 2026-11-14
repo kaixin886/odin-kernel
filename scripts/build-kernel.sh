@@ -169,14 +169,21 @@ if [ "$VARIANT" != "vanilla" ]; then
 
   # 5.4 task_struct refcounting: get_task_struct()/put_task_struct() live
   # in <linux/sched/task.h> here; on 5.10+ they are reachable via
-  # <linux/sched.h> alone. dynamic_manager.c includes sched.h but not
-  # sched/task.h, so put_task_struct() is implicitly declared and
-  # -Werror turns it into a build failure.
-  DYMANAGER="$KSRC/drivers/kernelsu/manager/dynamic_manager.c"
-  if ! grep -q '#include <linux/sched/task\.h>' "$DYMANAGER"; then
-    sed -i 's|#include <linux/sched\.h>|#include <linux/sched.h>\n#include <linux/sched/task.h>|' "$DYMANAGER"
-    echo "patched: dynamic_manager.c + linux/sched/task.h (5.4 put_task_struct)"
-  fi
+  # <linux/sched.h> alone. Any FinaSU file that calls them without
+  # including sched/task.h gets an implicit declaration, which -Werror
+  # turns into a build failure. #6 hit dynamic_manager.c, #7 hit
+  # policy/allowlist.c — sweep every caller instead of patching one
+  # file at a time (files that already include it are left alone).
+  for f in $(grep -rlE 'get_task_struct|put_task_struct' "$KSRC/drivers/kernelsu" --include='*.c' || true); do
+    if ! grep -q '#include <linux/sched/task\.h>' "$f"; then
+      if grep -q '#include <linux/sched\.h>' "$f"; then
+        sed -i 's|#include <linux/sched\.h>|&\n#include <linux/sched/task.h>|' "$f"
+      else
+        sed -i '0,/^#include .*/s//&\n#include <linux\/sched\/task.h>/' "$f"
+      fi
+      echo "patched: ${f#"$KSRC"/} + linux/sched/task.h (5.4 put/get_task_struct)"
+    fi
+  done
 
   # 5.4 fsnotify: struct fsnotify_ops has no .handle_inode_event (added
   # in 5.9); the single .handle_event hook carries the child name for
