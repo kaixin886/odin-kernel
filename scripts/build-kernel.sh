@@ -28,6 +28,10 @@ mkdir -p "$WORK" "$OUT"
 
 KERNEL_URL="https://github.com/Inkypen79/kernel_xiaomi_odin.git"
 KERNEL_BRANCH="lineage-24.0"
+if [ "$VARIANT" = "finasu-susfs" ]; then
+  # Inkypen's susfs branch is lineage-24.0 + his susfs v2.1.0 import.
+  KERNEL_BRANCH="susfs"
+fi
 FINASU_URL="https://github.com/LyraVoid/FinaSU.git"
 CLANG_WANT="clang-r574158"
 
@@ -123,8 +127,10 @@ if [ "$VARIANT" = "finasu" ] || [ "$VARIANT" = "finasu-susfs" ]; then
   ( cd "$KSRC" && bash "$FDIR/kernel/setup.sh" --dir "$FDIR" )
 
   if [ "$VARIANT" = "finasu-susfs" ]; then
-    echo "ERROR: finasu-susfs is phase 3 and not wired up yet." >&2
-    exit 1
+    step "verify susfs import present in kernel tree"
+    test -f "$KSRC/include/linux/susfs_def.h"
+    grep -q 'SUSFS_VERSION "v2.1.0"' "$KSRC/include/linux/susfs.h"
+    echo "susfs v2.1.0 import confirmed"
   fi
 
   step "extract manager signature from official FinaSU manager APK"
@@ -861,6 +867,7 @@ print("patched: kernel_umount.c path_umount -> ksys_umount (5.4)")
 PYEOF
   fi
 
+  if [ "$VARIANT" = "finasu" ]; then
   # BISECT history (diagnostic, 2026-11-14): vanilla BOOTED; finasu
   # full HUNG. BISECT1 (cluster off) BOOTED. BISECT2 (syscall pair
   # on) HUNG. BISECT3 (dispatcher only) BOOTED. BISECT4 (tp skipped)
@@ -960,6 +967,85 @@ open(brg_path, "w").write(src)
 print("patched: bisect10 - stat/access hooks are pure pass-through")
 PYEOF
   fi
+  elif [ "$VARIANT" = "finasu-susfs" ]; then
+  # SUSFS wiring (phase 3, 2026-11-15): after ten bisects the tp
+  # redirect itself is the blocker on this tree - any build where a
+  # syscall is actually redirected dies at the Mi logo, including a
+  # pure pass-through hook (bisect10) - so the tp line is parked and
+  # the SUSFS configuration goes first; it is also the configuration
+  # with working 5.4 references (venus port, Neko kernel). Kept from
+  # the bisect campaign: preinit runner swap off (venus diagnostic
+  # builds force the same) and the tp_marker kretprobe pair off.
+  # The susfs v2.1.0 kernel side lacks the per-task no_su flag family
+  # FinaSU's glue expects from v2.2+; supply prototypes in the
+  # kernel's susfs_def.h and degraded definitions in extension/
+  # susfs.c: no_su never sets, and the zygote_next umount mark
+  # collapses onto the plain umounted mark (the venus 5.4 collapse).
+  SUS_DEF="$KSRC/include/linux/susfs_def.h"
+  EXT_C="$KSRC/drivers/kernelsu/extension/susfs.c"
+  PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
+  MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
+  if ! grep -q 'susfs-wired' "$EXT_C"; then
+    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" <<'PYEOF'
+import sys
+def_path, ext_path, pre_path, mgr_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def rep(src, old, new, expect=1):
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: expected {expect} match, found {n} for {old[:50]!r}", file=sys.stderr)
+        sys.exit(1)
+    return src.replace(old, new)
+
+src = open(def_path).read()
+src += """
+/* odin-5.4 glue (susfs-wired): v2.1.0 lacks the no_su flag family */
+bool susfs_is_current_proc_no_su(void);
+void susfs_set_current_proc_no_su(void);
+void susfs_set_current_proc_umounted_for_zygote_next(void);
+"""
+open(def_path, "w").write(src)
+
+src = open(ext_path).read()
+src += """
+/* odin-5.4 glue (susfs-wired): degraded no_su family for susfs v2.1.0 */
+bool susfs_is_current_proc_no_su(void)
+{
+    return false;
+}
+
+void susfs_set_current_proc_no_su(void)
+{
+}
+
+void susfs_set_current_proc_umounted_for_zygote_next(void)
+{
+    susfs_set_current_proc_umounted();
+}
+"""
+open(ext_path, "w").write(src)
+
+src = open(pre_path).read()
+old_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
+                               int orig_nr, struct pt_regs *regs, long *ret)
+{"""
+new_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
+                               int orig_nr, struct pt_regs *regs, long *ret)
+{
+    return false; /* susfs-wired: preinit runner swap disabled */"""
+src = rep(src, old_sig, new_sig)
+open(pre_path, "w").write(src)
+
+src = open(mgr_path).read()
+src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
+    "    syscall_regfunc_rp = NULL; /* susfs-wired: kretprobe pair not registered */")
+src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
+    "    syscall_unregfunc_rp = NULL; /* susfs-wired: kretprobe pair not registered */")
+open(mgr_path, "w").write(src)
+print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off")
+PYEOF
+  fi
+  fi
 
 
 fi
@@ -974,6 +1060,9 @@ if [ "$VARIANT" != "vanilla" ]; then
   "$KSRC/scripts/config" --file "$CFG" \
     --enable KSU --enable KPROBES --enable KALLSYMS_ALL \
     --enable EXT4_FS --enable HEADERS_INSTALL
+  if [ "$VARIANT" = "finasu-susfs" ]; then
+    "$KSRC/scripts/config" --file "$CFG" --enable KSU_SUSFS
+  fi
 fi
 
 if [ "$OPTS" = "smooth" ]; then
@@ -989,7 +1078,7 @@ elif [ "$OPTS" = "battery" ]; then
 fi
 
 make "${MAKE_ARGS[@]}" olddefconfig
-grep -E '^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|HZ|WQ_POWER_EFFICIENT_DEFAULT)=' "$CFG" || true
+grep -E '^CONFIG_(KSU|KSU_SUSFS|KPROBES|KALLSYMS_ALL|HZ|WQ_POWER_EFFICIENT_DEFAULT)=' "$CFG" || true
 
 # ---------------------------------------------------------------- build
 step "build Image"
