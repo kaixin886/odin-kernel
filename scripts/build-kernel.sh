@@ -862,17 +862,20 @@ PYEOF
   fi
 
   # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at the
-  # Mi logo on real hardware while vanilla booted. BISECT1 disabled the
-  # whole invasive boot-time hook cluster in kernelsu_init (syscall
-  # dispatcher install, selinux_hide's selinuxfs open hook, avc_spoof's
-  # boot kprobe, syscall hook manager) and that build BOOTED - so the
-  # poison is inside that cluster, KSU core is clean.
-  # BISECT2: restore the syscall hook pair (dispatcher + manager) so the
-  # manager can talk to the kernel again; keep only the SELinux pair
-  # (selinux_hide_init, avc_spoof_init) disabled. Boots -> poison is in
-  # the SELinux pair. Hangs -> poison is the syscall dispatcher machinery.
+  # Mi logo on real hardware while vanilla booted. BISECT1 (whole invasive
+  # hook cluster off: syscall dispatcher install, selinux_hide, avc_spoof,
+  # syscall hook manager) BOOTED - KSU core is clean. BISECT2 (syscall
+  # pair restored, SELinux pair still off) HUNG again - the poison is in
+  # the syscall pair. Code review: sucompat/setuid inits are trivial;
+  # patch_memory is the standard fixmap+stop_machine poke; ORIG_SYSCALL
+  # stashes in regs[8], which is correct on arm64.
+  # BISECT3: dispatcher install (ksu_syscall_hook_init) ON, hook manager
+  # (tracepoint redirect + hook registrations) OFF, SELinux pair still
+  # OFF. Boots -> the install is innocent and the redirect chain executed
+  # via the sys_enter tracepoint is the killer. Hangs -> the sys_call_
+  # table patch / ni-slot search / symbol resolution itself is.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
-  if ! grep -q 'bisect2-off' "$INIT_C"; then
+  if ! grep -q 'bisect3-off' "$INIT_C"; then
     python3 - "$INIT_C" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -887,12 +890,14 @@ def rep(old, new, expect=1):
     src = src.replace(old, new)
 
 rep("    ksu_selinux_hide_init();",
-    "    /* bisect2-off: ksu_selinux_hide_init(); */")
+    "    /* bisect3-off: ksu_selinux_hide_init(); */")
 rep("    ksu_avc_spoof_init();",
-    "    /* bisect2-off: ksu_avc_spoof_init(); */")
+    "    /* bisect3-off: ksu_avc_spoof_init(); */")
+rep("        ksu_syscall_hook_manager_init();",
+    "        /* bisect3-off: ksu_syscall_hook_manager_init(); */", 2)
 
 open(path, "w").write(src)
-print("patched: core/init.c bisect2 selinux pair disabled")
+print("patched: core/init.c bisect3 manager+selinux off, dispatcher install on")
 PYEOF
   fi
 fi
