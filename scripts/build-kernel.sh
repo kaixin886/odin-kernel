@@ -158,6 +158,15 @@ if [ "$VARIANT" != "vanilla" ]; then
     echo "patched: sucompat.c linux/pgtable.h -> asm/pgtable.h"
   fi
 
+  # include/linux/minmax.h exists only since 6.2; on 5.4 min/max/min_t/
+  # max_t live in <linux/kernel.h>. #12 died in sulog/event.c, which
+  # uses only min() and min_t() — retarget the include in every
+  # FinaSU file that has it (this checkout: only sulog/event.c).
+  for f in $(grep -rl '#include <linux/minmax\.h>' "$KSRC/drivers/kernelsu" || true); do
+    sed -i 's|#include <linux/minmax\.h>|#include <linux/kernel.h>|' "$f"
+    echo "patched: ${f#"$KSRC"/} linux/minmax.h -> linux/kernel.h (5.4)"
+  done
+
   # 5.4 task_work: task_work_add() takes a bool (true == TWA_RESUME);
   # the TWA_* enum only exists from 5.5. Same one-token fix in all sites
   # (pkg_observer, dynamic_manager, allowlist, supercall).
