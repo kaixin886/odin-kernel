@@ -841,6 +841,41 @@ open(path, "w").write(src)
 print("patched: kernel_umount.c path_umount -> ksys_umount (5.4)")
 PYEOF
   fi
+
+  # BISECT1 (diagnostic, 2026-11-14): the finasu kernel dies at the Mi logo
+  # on real hardware while vanilla boots. Disable the invasive boot-time
+  # hook cluster in kernelsu_init - the syscall dispatcher install (patches
+  # sys_call_table), selinux_hide's selinuxfs open hook, avc_spoof's boot
+  # kprobe, and the syscall hook manager - to split "hook machinery" from
+  # "KSU core" as the fault domain. Restore selectively once it boots.
+  INIT_C="$KSRC/drivers/kernelsu/core/init.c"
+  if ! grep -q 'bisect1-off' "$INIT_C"; then
+    python3 - "$INIT_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: init.c: expected {expect} match, found {n} for {old[:50]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep("    ksu_syscall_hook_init();",
+    "    /* bisect1-off: ksu_syscall_hook_init(); */")
+rep("    ksu_selinux_hide_init();",
+    "    /* bisect1-off: ksu_selinux_hide_init(); */")
+rep("    ksu_avc_spoof_init();",
+    "    /* bisect1-off: ksu_avc_spoof_init(); */")
+rep("        ksu_syscall_hook_manager_init();",
+    "        /* bisect1-off: ksu_syscall_hook_manager_init(); */", 2)
+
+open(path, "w").write(src)
+print("patched: core/init.c bisect1 hook cluster disabled")
+PYEOF
+  fi
 fi
 
 # ---------------------------------------------------------------- config
