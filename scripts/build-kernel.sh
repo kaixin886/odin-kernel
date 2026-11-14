@@ -866,26 +866,21 @@ PYEOF
   # BISECT2 (syscall pair on) HUNG. BISECT3 (dispatcher install only)
   # BOOTED. BISECT4 (tp registration skipped) BOOTED. BISECT5
   # (kretprobe pair removed, tp active) HUNG. BISECT6 (no hooks
-  # registered, tp active) BOOTED - the poison is inside the five hook
-  # functions, not the handler/dispatcher/marking machinery.
-  # Code review of the execve path found the prime suspect: the
-  # preinit mechanism. When PID 1 execs /system/bin/init with
-  # argv[1]=="selinux_setup", ksu_preinit_handle_execve swaps the
-  # exec to an embedded runner ELF staged in a shmem file; the runner
-  # runs as PID 1 in place of init's selinux_setup stage. If that
-  # runner misbehaves on this ROM, boot dies exactly as observed:
-  # first logo, no logs. The sucompat stat/access/execve handlers by
-  # contrast are allowlist-gated pass-throughs at boot.
-  # BISECT7: bisect6 baseline + all five hooks registered again, but
-  # ksu_preinit_handle_execve returns false immediately (runner never
-  # swapped in; preinit staging still runs, it ran in every build).
-  # Boots -> preinit runner swap is the poison; ship with it off
-  # (FinaSU falls back to its normal ksud boot path). Hangs -> next
-  # split is the ksud execve hook vs the sucompat trio.
+  # registered, tp active) BOOTED - poison inside the five hooks.
+  # BISECT7 (preinit runner swap disabled, hooks on) HUNG - preinit
+  # is innocent too. What remains in the hooks-on path: the execve
+  # bridge (ksud boot-event tracker on every execve via a static
+  # branch, sulog argv capture for root execves, init mark tracker,
+  # sucompat), the thin stat/access sucompat pair, and the setresuid
+  # post-processing.
+  # BISECT8: bisect7 config minus the execve/execveat hook
+  # registrations. Boots -> the poison lives in the execve bridge;
+  # split ksud tracker vs sucompat vs sulog next. Hangs -> the
+  # stat/access/setresuid trio is guilty instead.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
   PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
-  if ! grep -q 'bisect7-off' "$INIT_C"; then
+  if ! grep -q 'bisect8-off' "$INIT_C"; then
     python3 - "$INIT_C" "$MGR_C" "$PRE_C" <<'PYEOF'
 import sys
 init_path, mgr_path, pre_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -899,16 +894,20 @@ def rep(src, old, new, expect=1):
 
 src = open(init_path).read()
 src = rep(src, "    ksu_selinux_hide_init();",
-    "    /* bisect7-off: ksu_selinux_hide_init(); */")
+    "    /* bisect8-off: ksu_selinux_hide_init(); */")
 src = rep(src, "    ksu_avc_spoof_init();",
-    "    /* bisect7-off: ksu_avc_spoof_init(); */")
+    "    /* bisect8-off: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
 
 src = open(mgr_path).read()
 src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
-    "    syscall_regfunc_rp = NULL; /* bisect7-off: kretprobe pair not registered */")
+    "    syscall_regfunc_rp = NULL; /* bisect8-off: kretprobe pair not registered */")
 src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
-    "    syscall_unregfunc_rp = NULL; /* bisect7-off: kretprobe pair not registered */")
+    "    syscall_unregfunc_rp = NULL; /* bisect8-off: kretprobe pair not registered */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);",
+    "    /* bisect8-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat);",
+    "    /* bisect8-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
 open(mgr_path, "w").write(src)
 
 src = open(pre_path).read()
@@ -918,12 +917,13 @@ old_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, c
 new_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
                                int orig_nr, struct pt_regs *regs, long *ret)
 {
-    return false; /* bisect7-off: preinit runner swap disabled */"""
+    return false; /* bisect8-off: preinit runner swap disabled */"""
 src = rep(src, old_sig, new_sig)
 open(pre_path, "w").write(src)
-print("patched: bisect7 - preinit swap off, all hooks registered, tp active, selinux pair off")
+print("patched: bisect8 - execve hooks off, stat/access/setresuid on, preinit off, selinux pair off")
 PYEOF
   fi
+
 
 fi
 
