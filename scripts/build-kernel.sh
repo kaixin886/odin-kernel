@@ -861,14 +861,18 @@ print("patched: kernel_umount.c path_umount -> ksys_umount (5.4)")
 PYEOF
   fi
 
-  # BISECT1 (diagnostic, 2026-11-14): the finasu kernel dies at the Mi logo
-  # on real hardware while vanilla boots. Disable the invasive boot-time
-  # hook cluster in kernelsu_init - the syscall dispatcher install (patches
-  # sys_call_table), selinux_hide's selinuxfs open hook, avc_spoof's boot
-  # kprobe, and the syscall hook manager - to split "hook machinery" from
-  # "KSU core" as the fault domain. Restore selectively once it boots.
+  # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at the
+  # Mi logo on real hardware while vanilla booted. BISECT1 disabled the
+  # whole invasive boot-time hook cluster in kernelsu_init (syscall
+  # dispatcher install, selinux_hide's selinuxfs open hook, avc_spoof's
+  # boot kprobe, syscall hook manager) and that build BOOTED - so the
+  # poison is inside that cluster, KSU core is clean.
+  # BISECT2: restore the syscall hook pair (dispatcher + manager) so the
+  # manager can talk to the kernel again; keep only the SELinux pair
+  # (selinux_hide_init, avc_spoof_init) disabled. Boots -> poison is in
+  # the SELinux pair. Hangs -> poison is the syscall dispatcher machinery.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
-  if ! grep -q 'bisect1-off' "$INIT_C"; then
+  if ! grep -q 'bisect2-off' "$INIT_C"; then
     python3 - "$INIT_C" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -882,17 +886,13 @@ def rep(old, new, expect=1):
         sys.exit(1)
     src = src.replace(old, new)
 
-rep("    ksu_syscall_hook_init();",
-    "    /* bisect1-off: ksu_syscall_hook_init(); */")
 rep("    ksu_selinux_hide_init();",
-    "    /* bisect1-off: ksu_selinux_hide_init(); */")
+    "    /* bisect2-off: ksu_selinux_hide_init(); */")
 rep("    ksu_avc_spoof_init();",
-    "    /* bisect1-off: ksu_avc_spoof_init(); */")
-rep("        ksu_syscall_hook_manager_init();",
-    "        /* bisect1-off: ksu_syscall_hook_manager_init(); */", 2)
+    "    /* bisect2-off: ksu_avc_spoof_init(); */")
 
 open(path, "w").write(src)
-print("patched: core/init.c bisect1 hook cluster disabled")
+print("patched: core/init.c bisect2 selinux pair disabled")
 PYEOF
   fi
 fi
