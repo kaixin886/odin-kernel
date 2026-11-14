@@ -862,25 +862,25 @@ PYEOF
   fi
 
   # BISECT history (diagnostic, 2026-11-14): vanilla BOOTED; finasu
-  # full HUNG at the Mi logo. BISECT1 (hook cluster off) BOOTED.
-  # BISECT2 (syscall pair on) HUNG. BISECT3 (dispatcher install only)
-  # BOOTED. BISECT4 (tp registration skipped) BOOTED. BISECT5
-  # (kretprobe pair removed, tp active) HUNG. BISECT6 (no hooks
-  # registered, tp active) BOOTED - poison inside the five hooks.
-  # BISECT7 (preinit runner swap disabled, hooks on) HUNG - preinit
-  # is innocent too. What remains in the hooks-on path: the execve
-  # bridge (ksud boot-event tracker on every execve via a static
-  # branch, sulog argv capture for root execves, init mark tracker,
-  # sucompat), the thin stat/access sucompat pair, and the setresuid
-  # post-processing.
-  # BISECT8: bisect7 config minus the execve/execveat hook
-  # registrations. Boots -> the poison lives in the execve bridge;
-  # split ksud tracker vs sucompat vs sulog next. Hangs -> the
-  # stat/access/setresuid trio is guilty instead.
+  # full HUNG. BISECT1 (cluster off) BOOTED. BISECT2 (syscall pair
+  # on) HUNG. BISECT3 (dispatcher only) BOOTED. BISECT4 (tp skipped)
+  # BOOTED. BISECT5 (kretprobes off, tp on) HUNG. BISECT6 (no hooks)
+  # BOOTED. BISECT7 (preinit off, hooks on) HUNG - preinit innocent.
+  # BISECT8 (execve hooks off) HUNG - the whole execve bridge,
+  # including the ksud second_stage tracker and apply_kernelsu_rules,
+  # is innocent. The poison is in {setresuid, newfstatat, faccessat}.
+  # Code review: the stat/access sucompat handlers are allowlist
+  # gated and inert at boot (uid 0 needs the ksu domain, app uids
+  # need an allowlist entry; neither exists yet). The setresuid
+  # handler runs ksu_handle_umount and tracepoint-flag surgery after
+  # every successful setresuid.
+  # BISECT9: bisect8 minus the setresuid registration. Boots ->
+  # setresuid post-processing is the poison. Hangs -> the stat/access
+  # pair is, and only one more split remains after that.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
   PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
-  if ! grep -q 'bisect8-off' "$INIT_C"; then
+  if ! grep -q 'bisect9-off' "$INIT_C"; then
     python3 - "$INIT_C" "$MGR_C" "$PRE_C" <<'PYEOF'
 import sys
 init_path, mgr_path, pre_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -894,20 +894,22 @@ def rep(src, old, new, expect=1):
 
 src = open(init_path).read()
 src = rep(src, "    ksu_selinux_hide_init();",
-    "    /* bisect8-off: ksu_selinux_hide_init(); */")
+    "    /* bisect9-off: ksu_selinux_hide_init(); */")
 src = rep(src, "    ksu_avc_spoof_init();",
-    "    /* bisect8-off: ksu_avc_spoof_init(); */")
+    "    /* bisect9-off: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
 
 src = open(mgr_path).read()
 src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
-    "    syscall_regfunc_rp = NULL; /* bisect8-off: kretprobe pair not registered */")
+    "    syscall_regfunc_rp = NULL; /* bisect9-off: kretprobe pair not registered */")
 src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
-    "    syscall_unregfunc_rp = NULL; /* bisect8-off: kretprobe pair not registered */")
+    "    syscall_unregfunc_rp = NULL; /* bisect9-off: kretprobe pair not registered */")
 src = rep(src, "    ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);",
-    "    /* bisect8-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
+    "    /* bisect9-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
 src = rep(src, "    ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat);",
-    "    /* bisect8-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
+    "    /* bisect9-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);",
+    "    /* bisect9-off: ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid); */")
 open(mgr_path, "w").write(src)
 
 src = open(pre_path).read()
@@ -917,10 +919,10 @@ old_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, c
 new_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
                                int orig_nr, struct pt_regs *regs, long *ret)
 {
-    return false; /* bisect8-off: preinit runner swap disabled */"""
+    return false; /* bisect9-off: preinit runner swap disabled */"""
 src = rep(src, old_sig, new_sig)
 open(pre_path, "w").write(src)
-print("patched: bisect8 - execve hooks off, stat/access/setresuid on, preinit off, selinux pair off")
+print("patched: bisect9 - only newfstatat+faccessat hooks remain registered")
 PYEOF
   fi
 
