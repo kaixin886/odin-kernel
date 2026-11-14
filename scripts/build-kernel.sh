@@ -128,25 +128,44 @@ if [ "$VARIANT" = "finasu" ] || [ "$VARIANT" = "finasu-susfs" ]; then
   fi
 
   step "extract manager signature from official FinaSU manager APK"
-  APK_URL="$(curl -s "https://api.github.com/repos/LyraVoid/FinaSU/releases/tags/$FINASU_REF" \
-    | python3 -c 'import json,sys
+  # The unauthenticated GitHub API is rate-limited per egress IP and the
+  # CI runners share theirs; several dispatches in an hour can exhaust it
+  # (the 2026-11-14 19:59 run died here with "asset not found" while the
+  # asset existed). Retry the lookup, and if it still fails fall back to
+  # the pinned cert values for the pinned release (derived locally from
+  # the official v1.3.2 manager APK and verified with
+  # scripts/extract_manager_cert.py).
+  KSU_SIZE=""
+  KSU_HASH=""
+  APK_URL=""
+  for attempt in 1 2 3; do
+    APK_URL="$(curl -s "https://api.github.com/repos/LyraVoid/FinaSU/releases/tags/$FINASU_REF" \
+      | python3 -c 'import json,sys
 rel = json.load(sys.stdin)
 for a in rel.get("assets", []):
     n = a.get("name", "")
     if n.endswith("-release.apk") and "FinaSU" in n:
-        print(a["browser_download_url"]); break')"
-  if [ -z "$APK_URL" ]; then
-    echo "ERROR: manager APK asset not found in release $FINASU_REF" >&2
-    exit 1
+        print(a["browser_download_url"]); break' 2>/dev/null)"
+    [ -n "$APK_URL" ] && break
+    echo "manager APK lookup attempt $attempt failed; retrying in 15s"
+    sleep 15
+  done
+  if [ -n "$APK_URL" ]; then
+    curl -sL "$APK_URL" -o "$WORK/manager.apk"
+    CERT_OUT="$(python3 "$ROOT/scripts/extract_manager_cert.py" "$WORK/manager.apk")"
+    echo "manager cert: $CERT_OUT"
+    KSU_SIZE="$(echo "$CERT_OUT" | sed -n 's/^KSU_EXPECTED_SIZE=//p')"
+    KSU_HASH="$(echo "$CERT_OUT" | sed -n 's/^KSU_EXPECTED_HASH=//p')"
   fi
-  curl -sL "$APK_URL" -o "$WORK/manager.apk"
-  CERT_OUT="$(python3 "$ROOT/scripts/extract_manager_cert.py" "$WORK/manager.apk")"
-  echo "manager cert: $CERT_OUT"
-  KSU_SIZE="$(echo "$CERT_OUT" | sed -n 's/^KSU_EXPECTED_SIZE=//p')"
-  KSU_HASH="$(echo "$CERT_OUT" | sed -n 's/^KSU_EXPECTED_HASH=//p')"
   if [ -z "$KSU_SIZE" ] || [ -z "$KSU_HASH" ]; then
-    echo "ERROR: failed to derive KSU_EXPECTED_SIZE / KSU_EXPECTED_HASH" >&2
-    exit 1
+    if [ "$FINASU_REF" = "v1.3.2" ]; then
+      echo "falling back to pinned manager cert values for $FINASU_REF"
+      KSU_SIZE="0x2cc"
+      KSU_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
+    else
+      echo "ERROR: failed to derive KSU_EXPECTED_SIZE / KSU_EXPECTED_HASH" >&2
+      exit 1
+    fi
   fi
   EXTRA_MAKE_VARS+=(KSU_EXPECTED_SIZE="$KSU_SIZE" KSU_EXPECTED_HASH="$KSU_HASH" KSU_REQUIRE_PREINIT=1)
 fi
