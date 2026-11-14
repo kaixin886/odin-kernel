@@ -699,6 +699,144 @@ PYEOF
       echo "patched: ${f#"$KSRC"/} + linux/sched/signal.h (5.4 task_pgrp/task_session)"
     fi
   done
+
+  # Link stage: FinaSU calls path_mount()/path_umount() (5.8+). On 5.4 the
+  # equivalents are do_mount()/ksys_umount() in fs/namespace.c - unexported,
+  # and string-based, so the two FinaSU call sites convert struct path via
+  # d_path() under KERNEL_DS. Same retarget the venus 5.4 builds use.
+  # #15 died at LD .tmp_vmlinux.kallsyms1 on exactly these two symbols.
+  NS_C="$KSRC/fs/namespace.c"
+  if ! grep -q 'EXPORT_SYMBOL(do_mount)' "$NS_C"; then
+    python3 - "$NS_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def export_after(sig, sym):
+    global src
+    idx = src.find(sig)
+    if idx < 0:
+        print(f"ERROR: namespace.c: definition not found for {sym}: {sig[:50]!r}", file=sys.stderr)
+        sys.exit(1)
+    end = src.find("\n}\n", idx)
+    if end < 0:
+        print(f"ERROR: namespace.c: end of {sym} definition not found", file=sys.stderr)
+        sys.exit(1)
+    end += len("\n}\n")
+    src = src[:end] + f"EXPORT_SYMBOL({sym});\n" + src[end:]
+
+export_after("long do_mount(const char *dev_name, const char __user *dir_name,", "do_mount")
+export_after("int ksys_umount(char __user *name, int flags)", "ksys_umount")
+
+open(path, "w").write(src)
+print("patched: fs/namespace.c EXPORT_SYMBOL(do_mount/ksys_umount) for KSU")
+PYEOF
+  fi
+
+  SMN_C="$KSRC/drivers/kernelsu/infra/su_mount_ns.c"
+  if ! grep -q '5.4 has no path_mount' "$SMN_C"; then
+    if ! grep -q '#include <linux/uaccess.h>' "$SMN_C"; then
+      sed -i 's|#include <linux/fs.h>|&\n#include <linux/uaccess.h>|' "$SMN_C"
+    fi
+    python3 - "$SMN_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: su_mount_ns.c: expected {expect} match, found {n} for {old[:60]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep('''extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags,
+                      void *data_page);''',
+'''/* 5.4 has no path_mount(); do_mount() takes a __user dir_name instead. */
+extern long do_mount(const char *dev_name, const char __user *dir_name,
+                     const char *type_page, unsigned long flags,
+                     void *data_page);''')
+
+rep('''    int pm_ret = path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);''',
+'''    int pm_ret;
+    {
+        char *dir = kmalloc(PATH_MAX, GFP_KERNEL);
+
+        if (dir) {
+            char *p2 = d_path(&root_path, dir, PATH_MAX);
+
+            if (!IS_ERR(p2)) {
+                mm_segment_t oldfs = get_fs();
+
+                set_fs(KERNEL_DS);
+                pm_ret = (int)do_mount(NULL, (const char __user *)p2, NULL, MS_PRIVATE | MS_REC, NULL);
+                set_fs(oldfs);
+            } else {
+                pm_ret = (int)PTR_ERR(p2);
+            }
+            kfree(dir);
+        } else {
+            pm_ret = -ENOMEM;
+        }
+    }''')
+
+open(path, "w").write(src)
+print("patched: su_mount_ns.c path_mount -> do_mount (5.4)")
+PYEOF
+  fi
+
+  KUM_C="$KSRC/drivers/kernelsu/feature/kernel_umount.c"
+  if ! grep -q '5.4 has no path_umount' "$KUM_C"; then
+    if ! grep -q '#include <linux/uaccess.h>' "$KUM_C"; then
+      sed -i 's|#include <linux/fs.h>|&\n#include <linux/uaccess.h>|' "$KUM_C"
+    fi
+    python3 - "$KUM_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: kernel_umount.c: expected {expect} match, found {n} for {old[:60]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep('''extern int path_umount(struct path *path, int flags);''',
+'''/* 5.4 has no path_umount(); ksys_umount() takes a path string. */
+extern int ksys_umount(char __user *name, int flags);''')
+
+rep('''static void ksu_umount_mnt(struct path *path, int flags)
+{
+    int err = path_umount(path, flags);''',
+'''static void ksu_umount_mnt(struct path *path, int flags)
+{
+    int err;
+    char *dir = kmalloc(PATH_MAX, GFP_KERNEL);
+
+    if (!dir)
+        return;
+    {
+        char *p2 = d_path(path, dir, PATH_MAX);
+
+        if (!IS_ERR(p2)) {
+            mm_segment_t oldfs = get_fs();
+
+            set_fs(KERNEL_DS);
+            err = ksys_umount((char __user *)p2, flags);
+            set_fs(oldfs);
+        } else {
+            err = (int)PTR_ERR(p2);
+        }
+    }
+    kfree(dir);''')
+
+open(path, "w").write(src)
+print("patched: kernel_umount.c path_umount -> ksys_umount (5.4)")
+PYEOF
+  fi
 fi
 
 # ---------------------------------------------------------------- config
