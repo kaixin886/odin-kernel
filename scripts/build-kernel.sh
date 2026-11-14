@@ -167,6 +167,17 @@ if [ "$VARIANT" != "vanilla" ]; then
     echo "patched: ${f#"$KSRC"/} TWA_RESUME -> true"
   done
 
+  # 5.4 task_struct refcounting: get_task_struct()/put_task_struct() live
+  # in <linux/sched/task.h> here; on 5.10+ they are reachable via
+  # <linux/sched.h> alone. dynamic_manager.c includes sched.h but not
+  # sched/task.h, so put_task_struct() is implicitly declared and
+  # -Werror turns it into a build failure.
+  DYMANAGER="$KSRC/drivers/kernelsu/manager/dynamic_manager.c"
+  if ! grep -q '#include <linux/sched/task\.h>' "$DYMANAGER"; then
+    sed -i 's|#include <linux/sched\.h>|#include <linux/sched.h>\n#include <linux/sched/task.h>|' "$DYMANAGER"
+    echo "patched: dynamic_manager.c + linux/sched/task.h (5.4 put_task_struct)"
+  fi
+
   # 5.4 fsnotify: struct fsnotify_ops has no .handle_inode_event (added
   # in 5.9); the single .handle_event hook carries the child name for
   # inode marks, with the same (qstr *file_name, u32 cookie) tail.
