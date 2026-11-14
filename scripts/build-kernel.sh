@@ -507,6 +507,144 @@ print("patched: selinux_hide.c status page/lock + live policy -> 5.4 ss")
 PYEOF
   fi
 
+  if ! grep -q 'ksu54: <6.1 sidtab port' "$HIDE_C"; then
+    python3 - "$HIDE_C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+
+def rep(old, new, expect=1):
+    global src
+    n = src.count(old)
+    if n != expect:
+        print(f"ERROR: selinux_hide.c sidtab port: expected {expect} match, found {n} for {old[:60]!r}", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new)
+
+rep('''#include "ss/policydb.h"''',
+'''#include "ss/policydb.h"
+#include "ss/hashtab.h"''')
+
+rep('''#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+#define ksu_task_security_struct task_security_struct
+#else
+#define ksu_task_security_struct cred_security_struct
+#endif''',
+'''#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+#define ksu_task_security_struct task_security_struct
+#else
+#define ksu_task_security_struct cred_security_struct
+#endif
+
+/* <5.9 has no symtab_search(); the policydb symtabs are hashtab-backed.
+ * Same shim FinaSU itself uses in selinux/sepolicy.c. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+#define symtab_search(s, name) hashtab_search((s)->table, name)
+#endif''')
+
+rep('''static int sidtab_entry_to_string(struct policydb *p, struct sidtab *sidtab, struct sidtab_entry *entry,''',
+'''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static int sidtab_entry_to_string(struct policydb *p, struct sidtab *sidtab, struct sidtab_entry *entry,''')
+
+rep('''static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                               u32 *scontext_len)
+{
+    struct policydb *policydb;
+    struct sidtab *sidtab;
+    struct sidtab_entry *entry;
+    int rc = 0;
+
+    if (scontext)
+        *scontext = NULL;
+    *scontext_len = 0;
+
+    // removed: if (!selinux_initialized())
+    // removed: rcu lock
+    policydb = &policy->policydb;
+    sidtab = policy->sidtab;
+
+    // removed: force
+    entry = sidtab_search_entry(sidtab, sid);
+    if (!entry) {
+        pr_err("SELinux: %s:  unrecognized SID %d\\n", __func__, sid);
+        rc = -EINVAL;
+        goto out_unlock;
+    }
+    // removed: only_invalid
+
+    rc = sidtab_entry_to_string(policydb, sidtab, entry, scontext, scontext_len);
+
+out_unlock:
+    return rc;
+}''',
+'''static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                               u32 *scontext_len)
+{
+    struct policydb *policydb;
+    struct sidtab *sidtab;
+    struct sidtab_entry *entry;
+    int rc = 0;
+
+    if (scontext)
+        *scontext = NULL;
+    *scontext_len = 0;
+
+    // removed: if (!selinux_initialized())
+    // removed: rcu lock
+    policydb = &policy->policydb;
+    sidtab = policy->sidtab;
+
+    // removed: force
+    entry = sidtab_search_entry(sidtab, sid);
+    if (!entry) {
+        pr_err("SELinux: %s:  unrecognized SID %d\\n", __func__, sid);
+        rc = -EINVAL;
+        goto out_unlock;
+    }
+    // removed: only_invalid
+
+    rc = sidtab_entry_to_string(policydb, sidtab, entry, scontext, scontext_len);
+
+out_unlock:
+    return rc;
+}
+#else
+/* ksu54: <6.1 sidtab port - this sidtab has no sidtab_entry and no
+ * sid->string cache; sidtab_search() returns the context directly. */
+static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                               u32 *scontext_len)
+{
+    struct policydb *policydb;
+    struct sidtab *sidtab;
+    struct context *context;
+    int rc = 0;
+
+    if (scontext)
+        *scontext = NULL;
+    *scontext_len = 0;
+
+    policydb = &policy->policydb;
+    sidtab = policy->sidtab;
+
+    context = sidtab_search(sidtab, sid);
+    if (!context) {
+        pr_err("SELinux: %s:  unrecognized SID %d\\n", __func__, sid);
+        rc = -EINVAL;
+        goto out_unlock;
+    }
+
+    rc = context_struct_to_string(policydb, context, scontext, scontext_len);
+
+out_unlock:
+    return rc;
+}
+#endif''')
+
+open(path, "w").write(src)
+print("patched: selinux_hide.c symtab_search shim + <6.1 sidtab port")
+PYEOF
+  fi
+
   # sepolicy.c add_filename_trans targets the 5.10 filename_trans layout
   # (filename_trans_key + stypes-bitmap datum). On 5.4 the table is keyed by
   # (stype, ttype, tclass, name) and the datum is a bare otype, so swap in
