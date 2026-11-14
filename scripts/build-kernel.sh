@@ -861,31 +861,25 @@ print("patched: kernel_umount.c path_umount -> ksys_umount (5.4)")
 PYEOF
   fi
 
-  # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at the
-  # Mi logo on real hardware while vanilla booted. BISECT1 (whole hook
-  # cluster off) BOOTED - KSU core clean. BISECT2 (syscall pair on,
-  # SELinux pair off) HUNG. BISECT3 (dispatcher install on, manager off)
-  # BOOTED - the table patch is innocent; poison inside the manager.
-  # BISECT4 (manager on, sys_enter tracepoint registration skipped)
-  # BOOTED - registering the hooks is fine; activating the sys_enter
-  # probe is the fatal step. Two coupled suspects remain: (A) the
-  # kretprobes on syscall_regfunc/syscall_unregfunc, whose handlers run
-  # tp_marker process-marking (tasklist walk, per-task cred + SELinux
-  # domain checks) in kretprobe-return context the moment our own probe
-  # registration makes the kernel call syscall_regfunc - during the
-  # initcall, with SELinux policy not yet loaded; and (C) the redirect
-  # execution itself (handler rewrites regs, dispatcher runs the
-  # sucompat hooks, which call the originals through the table).
-  # BISECT5: manager fully ON with tracepoint registration restored, but
-  # the kretprobe pair is not registered. The kernel's own regfunc still
-  # marks all tasks (and the flag is inherited on clone), so redirect
-  # coverage is unaffected in practice; the pair only maintains marking
-  # granularity when third-party tracers come and go. Boots -> (A) is
-  # the poison and this removal is the fix. Hangs -> (C) is, and the
-  # sucompat hooks themselves need 5.4 surgery.
+  # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at
+  # the Mi logo on real hardware while vanilla booted. BISECT1 (whole
+  # hook cluster off) BOOTED. BISECT2 (syscall pair on, SELinux pair
+  # off) HUNG. BISECT3 (dispatcher install on, manager off) BOOTED.
+  # BISECT4 (manager on, sys_enter registration skipped) BOOTED.
+  # BISECT5 (kretprobe pair removed, tp redirect active) HUNG - the
+  # kretprobe/tp_marker machinery is innocent; the poison is the
+  # redirect EXECUTION: sys_enter handler rewrites regs -> dispatcher
+  # -> one of the five sucompat hooks (setresuid, execve, execveat,
+  # newfstatat, faccessat) running on this 5.4 tree.
+  # BISECT6: same as bisect5 but NO hooks are registered, so the
+  # handler fires on every syscall yet never redirects anything.
+  # Boots -> one of the five hook functions is toxic; split them next.
+  # Hangs -> the handler/dispatcher regs dance itself is incompatible
+  # with this tree's syscall entry path, and the tp-dispatcher design
+  # has to be abandoned for the SUSFS hook mode.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
-  if ! grep -q 'bisect5-off' "$INIT_C"; then
+  if ! grep -q 'bisect6-off' "$INIT_C"; then
     python3 - "$INIT_C" "$MGR_C" <<'PYEOF'
 import sys
 init_path, mgr_path = sys.argv[1], sys.argv[2]
@@ -899,19 +893,30 @@ def rep(src, old, new, expect=1):
 
 src = open(init_path).read()
 src = rep(src, "    ksu_selinux_hide_init();",
-    "    /* bisect5-off: ksu_selinux_hide_init(); */")
+    "    /* bisect6-off: ksu_selinux_hide_init(); */")
 src = rep(src, "    ksu_avc_spoof_init();",
-    "    /* bisect5-off: ksu_avc_spoof_init(); */")
+    "    /* bisect6-off: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
 
 src = open(mgr_path).read()
 src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
-    "    syscall_regfunc_rp = NULL; /* bisect5-off: kretprobe pair not registered */")
+    "    syscall_regfunc_rp = NULL; /* bisect6-off: kretprobe pair not registered */")
 src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
-    "    syscall_unregfunc_rp = NULL; /* bisect5-off: kretprobe pair not registered */")
+    "    syscall_unregfunc_rp = NULL; /* bisect6-off: kretprobe pair not registered */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);",
+    "    /* bisect6-off: ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);",
+    "    /* bisect6-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat);",
+    "    /* bisect6-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat);",
+    "    /* bisect6-off: ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);",
+    "    /* bisect6-off: ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat); */")
 open(mgr_path, "w").write(src)
-print("patched: bisect5 - kretprobe pair removed, tp redirect active, selinux pair off")
+print("patched: bisect6 - no hooks registered, tp active, kretprobes off, selinux pair off")
 PYEOF
+
   fi
 fi
 
