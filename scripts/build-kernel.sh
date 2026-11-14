@@ -40,7 +40,7 @@ step "install host dependencies"
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
   bc bison flex libssl-dev libelf-dev libdw-dev dwarves \
-  zip unzip python3 git curl wget xz-utils zstd \
+  zip unzip python3 git curl wget xz-utils zstd patch \
   build-essential gcc-aarch64-linux-gnu
 
 # ---------------------------------------------------------------- clang
@@ -496,6 +496,16 @@ rep('''    orig_policy = rcu_dereference(selinux_state.policy);
 open(path, "w").write(src)
 print("patched: selinux_hide.c status page/lock + live policy -> 5.4 ss")
 PYEOF
+  fi
+
+  # sepolicy.c add_filename_trans targets the 5.10 filename_trans layout
+  # (filename_trans_key + stypes-bitmap datum). On 5.4 the table is keyed by
+  # (stype, ttype, tclass, name) and the datum is a bare otype, so swap in
+  # the 5.4 implementation shipped in patches/ for < 5.10.
+  if [ -f "$ROOT/patches/sepolicy-filename-trans-5.4.patch" ]; then
+    patch -d "$KSRC" -p1 -s --no-backup-if-mismatch \
+      < "$ROOT/patches/sepolicy-filename-trans-5.4.patch"
+    echo "patched: sepolicy.c add_filename_trans -> 5.4 port"
   fi
 fi
 
