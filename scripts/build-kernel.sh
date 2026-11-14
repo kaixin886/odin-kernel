@@ -518,6 +518,14 @@ PYEOF
       "$KSRC/drivers/kernelsu/selinux/sepolicy.c"
     echo "patched: sepolicy.c add_filename_trans -> 5.4 port"
   fi
+
+  # <linux/minmax.h> was split out of <linux/kernel.h> in 6.5; on 5.4 the
+  # min/max/clamp family still lives in <linux/kernel.h>. #12 died on
+  # sulog/event.c (min_t/min) including it — sweep every includer.
+  for f in $(grep -rl '#include <linux/minmax\.h>' "$KSRC/drivers/kernelsu" --include='*.c' --include='*.h' || true); do
+    sed -i 's|#include <linux/minmax\.h>|#include <linux/kernel.h>|' "$f"
+    echo "patched: ${f#"$KSRC"/} linux/minmax.h -> linux/kernel.h (5.4)"
+  done
 fi
 
 # ---------------------------------------------------------------- config
