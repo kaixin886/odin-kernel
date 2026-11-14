@@ -885,7 +885,9 @@ grep -o '"[^"]*"' "$WORK/kout/include/generated/utsrelease.h" | head -1 | tr -d 
 # Package an AnyKernel3 zip next to the raw Image so the kernel can be
 # flashed on-device (e.g. Horizon Kernel Flasher), no PC needed. Template:
 # osm0sis/AnyKernel3 pinned by commit; our anykernel.sh in scripts/ak3/.
-if [ "$VARIANT" != "vanilla" ]; then
+# Built for every variant: a vanilla AK3 is the cleanest bisection tool
+# when a kernel fails to boot (packaging fault vs kernel-code fault).
+if true; then
   step "package AnyKernel3 zip"
   AK3_DIR="$WORK/ak3"
   mkdir -p "$AK3_DIR"
