@@ -503,8 +503,19 @@ PYEOF
   # (stype, ttype, tclass, name) and the datum is a bare otype, so swap in
   # the 5.4 implementation shipped in patches/ for < 5.10.
   if [ -f "$ROOT/patches/sepolicy-filename-trans-5.4.patch" ]; then
-    patch -d "$KSRC" -p1 -s --no-backup-if-mismatch \
-      < "$ROOT/patches/sepolicy-filename-trans-5.4.patch"
+    # drivers/kernelsu is a symlink into the FinaSU clone, and GNU patch
+    # refuses to patch a file beyond a symbolic link (it asks "File to
+    # patch:" and skips every hunk). Resolve the real directory, rebase
+    # the patch header prefix onto it, and verify the guard landed.
+    KSU_REAL="$(readlink -f "$KSRC/drivers/kernelsu")"
+    sed -e 's|^--- a/drivers/kernelsu/|--- a/|' \
+        -e 's|^+++ b/drivers/kernelsu/|+++ b/|' \
+        "$ROOT/patches/sepolicy-filename-trans-5.4.patch" \
+        > "$WORK/sepolicy-filename-trans-5.4.rebased.patch"
+    patch -d "$KSU_REAL" -p1 -s --batch --no-backup-if-mismatch \
+      < "$WORK/sepolicy-filename-trans-5.4.rebased.patch"
+    grep -q 'KERNEL_VERSION(5, 10, 0)' \
+      "$KSRC/drivers/kernelsu/selinux/sepolicy.c"
     echo "patched: sepolicy.c add_filename_trans -> 5.4 port"
   fi
 fi
