@@ -157,6 +157,47 @@ if [ "$VARIANT" != "vanilla" ]; then
     sed -i 's|#include <linux/pgtable\.h>|#include <asm/pgtable.h>|' "$SUCOMPAT"
     echo "patched: sucompat.c linux/pgtable.h -> asm/pgtable.h"
   fi
+
+  # 5.4 task_work: task_work_add() takes a bool (true == TWA_RESUME);
+  # the TWA_* enum only exists from 5.5. Same one-token fix in all sites
+  # (pkg_observer, dynamic_manager, allowlist, supercall).
+  TWA_FILES="$(grep -rl 'TWA_RESUME' "$KSRC/drivers/kernelsu" || true)"
+  for f in $TWA_FILES; do
+    sed -i 's/TWA_RESUME/true/g' "$f"
+    echo "patched: ${f#"$KSRC"/} TWA_RESUME -> true"
+  done
+
+  # 5.4 fsnotify: struct fsnotify_ops has no .handle_inode_event (added
+  # in 5.9); the single .handle_event hook carries the child name for
+  # inode marks, with the same (qstr *file_name, u32 cookie) tail.
+  PKGOBS="$KSRC/drivers/kernelsu/manager/pkg_observer.c"
+  if grep -q 'handle_inode_event' "$PKGOBS"; then
+    python3 - "$PKGOBS" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+src = open(path).read()
+pat_fn = re.compile(
+    r"static int ksu_handle_inode_event\(struct fsnotify_mark \*mark, u32 mask, "
+    r"struct inode \*inode, struct inode \*dir,\s+const struct qstr \*file_name, u32 cookie\)\n")
+new_fn = (
+    "/* 5.4: no .handle_inode_event in struct fsnotify_ops (added in 5.9);\n"
+    " * .handle_event carries the child name for inode marks instead. */\n"
+    "static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,\n"
+    "\t\t\t    u32 mask, const void *data, int data_type,\n"
+    "\t\t\t    const struct qstr *file_name, u32 cookie,\n"
+    "\t\t\t    struct fsnotify_iter_info *iter_info)\n")
+pat_op = re.compile(r"[ \t]*\.handle_inode_event = ksu_handle_inode_event,\n")
+new_op = "\t.handle_event = ksu_handle_event,\n"
+for pat, new in ((pat_fn, new_fn), (pat_op, new_op)):
+    found = pat.findall(src)
+    if len(found) != 1:
+        print(f"ERROR: expected 1 match for {pat.pattern[:50]!r}, found {len(found)}", file=sys.stderr)
+        sys.exit(1)
+    src = pat.sub(new, src)
+open(path, "w").write(src)
+print("patched: pkg_observer.c handle_inode_event -> handle_event (5.4)")
+PYEOF
+  fi
 fi
 
 # ---------------------------------------------------------------- config
