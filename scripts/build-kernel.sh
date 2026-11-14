@@ -535,6 +535,32 @@ PYEOF
     sed -i 's|#include <linux/minmax\.h>|#include <linux/kernel.h>|' "$f"
     echo "patched: ${f#"$KSRC"/} linux/minmax.h -> linux/kernel.h (5.4)"
   done
+
+  # 5.4: tasklist_lock and init_task are declared in <linux/sched/task.h>,
+  # task_pgrp()/task_session() in <linux/sched/signal.h>; newer kernels
+  # surface both transitively, 5.4 does not. #13 died in supercall/
+  # dispatch.c (do_set_init_pgrp) — sweep every file that uses these
+  # symbols without the matching include.
+  for f in $(grep -rlE 'tasklist_lock|&init_task' "$KSRC/drivers/kernelsu" --include='*.c' || true); do
+    if ! grep -q '#include <linux/sched/task\.h>' "$f"; then
+      if grep -q '#include <linux/sched\.h>' "$f"; then
+        sed -i 's|#include <linux/sched\.h>|&\n#include <linux/sched/task.h>|' "$f"
+      else
+        sed -i '0,/^#include .*/s//&\n#include <linux\/sched\/task.h>/' "$f"
+      fi
+      echo "patched: ${f#"$KSRC"/} + linux/sched/task.h (5.4 tasklist_lock/init_task)"
+    fi
+  done
+  for f in $(grep -rlE 'task_pgrp\(|task_session\(' "$KSRC/drivers/kernelsu" --include='*.c' || true); do
+    if ! grep -q '#include <linux/sched/signal\.h>' "$f"; then
+      if grep -q '#include <linux/sched\.h>' "$f"; then
+        sed -i 's|#include <linux/sched\.h>|&\n#include <linux/sched/signal.h>|' "$f"
+      else
+        sed -i '0,/^#include .*/s//&\n#include <linux\/sched\/signal.h>/' "$f"
+      fi
+      echo "patched: ${f#"$KSRC"/} + linux/sched/signal.h (5.4 task_pgrp/task_session)"
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------- config
