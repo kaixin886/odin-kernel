@@ -865,25 +865,31 @@ PYEOF
   # full HUNG. BISECT1 (cluster off) BOOTED. BISECT2 (syscall pair
   # on) HUNG. BISECT3 (dispatcher only) BOOTED. BISECT4 (tp skipped)
   # BOOTED. BISECT5 (kretprobes off, tp on) HUNG. BISECT6 (no hooks)
-  # BOOTED. BISECT7 (preinit off, hooks on) HUNG - preinit innocent.
-  # BISECT8 (execve hooks off) HUNG - the whole execve bridge,
-  # including the ksud second_stage tracker and apply_kernelsu_rules,
-  # is innocent. The poison is in {setresuid, newfstatat, faccessat}.
-  # Code review: the stat/access sucompat handlers are allowlist
-  # gated and inert at boot (uid 0 needs the ksu domain, app uids
-  # need an allowlist entry; neither exists yet). The setresuid
-  # handler runs ksu_handle_umount and tracepoint-flag surgery after
-  # every successful setresuid.
-  # BISECT9: bisect8 minus the setresuid registration. Boots ->
-  # setresuid post-processing is the poison. Hangs -> the stat/access
-  # pair is, and only one more split remains after that.
+  # BOOTED. BISECT7 (preinit off, hooks on) HUNG. BISECT8 (execve
+  # hooks off) HUNG. BISECT9 (only newfstatat+faccessat hooks left)
+  # HUNG. So even the thinnest pass-through pair kills boot.
+  # Code review found what those two hooks run on EVERY call at
+  # boot: ksu_is_allow_uid_for_current -> is_ksu_domain ->
+  # is_sid_match, whose slow path (cached_su_sid==0 until the
+  # second_stage cache_sid() runs, which needs the execve hook)
+  # calls __security_secid_to_secctx() - a SELinux sidtab-to-string
+  # conversion - for every single stat/access from every root
+  # process, starting in first-stage init while the policy is
+  # still loading.
+  # BISECT10: bisect9 config, but the two bridge hooks are reduced
+  # to pure pass-through (orig called immediately, sucompat logic
+  # skipped). Boots -> the sucompat handler logic (the gate slow
+  # path) is the poison and gets a proper fix. Hangs -> the
+  # redirect machinery itself is broken under high-frequency
+  # syscalls and the fight moves to handler/dispatcher deltas.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
   PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
-  if ! grep -q 'bisect9-off' "$INIT_C"; then
-    python3 - "$INIT_C" "$MGR_C" "$PRE_C" <<'PYEOF'
+  BRG_C="$KSRC/drivers/kernelsu/hook/syscall_event_bridge.c"
+  if ! grep -q 'bisect10-off' "$INIT_C"; then
+    python3 - "$INIT_C" "$MGR_C" "$PRE_C" "$BRG_C" <<'PYEOF'
 import sys
-init_path, mgr_path, pre_path = sys.argv[1], sys.argv[2], sys.argv[3]
+init_path, mgr_path, pre_path, brg_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 def rep(src, old, new, expect=1):
     n = src.count(old)
@@ -894,22 +900,22 @@ def rep(src, old, new, expect=1):
 
 src = open(init_path).read()
 src = rep(src, "    ksu_selinux_hide_init();",
-    "    /* bisect9-off: ksu_selinux_hide_init(); */")
+    "    /* bisect10-off: ksu_selinux_hide_init(); */")
 src = rep(src, "    ksu_avc_spoof_init();",
-    "    /* bisect9-off: ksu_avc_spoof_init(); */")
+    "    /* bisect10-off: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
 
 src = open(mgr_path).read()
 src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);',
-    "    syscall_regfunc_rp = NULL; /* bisect9-off: kretprobe pair not registered */")
+    "    syscall_regfunc_rp = NULL; /* bisect10-off: kretprobe pair not registered */")
 src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
-    "    syscall_unregfunc_rp = NULL; /* bisect9-off: kretprobe pair not registered */")
+    "    syscall_unregfunc_rp = NULL; /* bisect10-off: kretprobe pair not registered */")
 src = rep(src, "    ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);",
-    "    /* bisect9-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
+    "    /* bisect10-off: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
 src = rep(src, "    ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat);",
-    "    /* bisect9-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
+    "    /* bisect10-off: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
 src = rep(src, "    ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);",
-    "    /* bisect9-off: ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid); */")
+    "    /* bisect10-off: ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid); */")
 open(mgr_path, "w").write(src)
 
 src = open(pre_path).read()
@@ -919,10 +925,39 @@ old_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, c
 new_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
                                int orig_nr, struct pt_regs *regs, long *ret)
 {
-    return false; /* bisect9-off: preinit runner swap disabled */"""
+    return false; /* bisect10-off: preinit runner swap disabled */"""
 src = rep(src, old_sig, new_sig)
 open(pre_path, "w").write(src)
-print("patched: bisect9 - only newfstatat+faccessat hooks remain registered")
+
+src = open(brg_path).read()
+old_stat = """long __nocfi ksu_hook_newfstatat(int orig_nr, const struct pt_regs *regs)
+{
+    if (!ksu_su_compat_is_enabled())
+        return ksu_syscall_table[orig_nr](regs);
+
+    return ksu_handle_stat_sucompat(orig_nr, (struct pt_regs *)regs);
+}"""
+new_stat = """long __nocfi ksu_hook_newfstatat(int orig_nr, const struct pt_regs *regs)
+{
+    /* bisect10-off: pure pass-through, sucompat logic skipped */
+    return ksu_syscall_table[orig_nr](regs);
+}"""
+src = rep(src, old_stat, new_stat)
+old_acc = """long __nocfi ksu_hook_faccessat(int orig_nr, const struct pt_regs *regs)
+{
+    if (!ksu_su_compat_is_enabled())
+        return ksu_syscall_table[orig_nr](regs);
+
+    return ksu_handle_faccessat_sucompat(orig_nr, (struct pt_regs *)regs);
+}"""
+new_acc = """long __nocfi ksu_hook_faccessat(int orig_nr, const struct pt_regs *regs)
+{
+    /* bisect10-off: pure pass-through, sucompat logic skipped */
+    return ksu_syscall_table[orig_nr](regs);
+}"""
+src = rep(src, old_acc, new_acc)
+open(brg_path, "w").write(src)
+print("patched: bisect10 - stat/access hooks are pure pass-through")
 PYEOF
   fi
 
