@@ -863,41 +863,49 @@ PYEOF
 
   # BISECT history (diagnostic, 2026-11-14): the finasu kernel died at the
   # Mi logo on real hardware while vanilla booted. BISECT1 (whole invasive
-  # hook cluster off: syscall dispatcher install, selinux_hide, avc_spoof,
-  # syscall hook manager) BOOTED - KSU core is clean. BISECT2 (syscall
-  # pair restored, SELinux pair still off) HUNG again - the poison is in
-  # the syscall pair. Code review: sucompat/setuid inits are trivial;
-  # patch_memory is the standard fixmap+stop_machine poke; ORIG_SYSCALL
-  # stashes in regs[8], which is correct on arm64.
-  # BISECT3: dispatcher install (ksu_syscall_hook_init) ON, hook manager
-  # (tracepoint redirect + hook registrations) OFF, SELinux pair still
-  # OFF. Boots -> the install is innocent and the redirect chain executed
-  # via the sys_enter tracepoint is the killer. Hangs -> the sys_call_
-  # table patch / ni-slot search / symbol resolution itself is.
+  # hook cluster off) BOOTED - KSU core is clean. BISECT2 (syscall pair
+  # restored, SELinux pair still off) HUNG again - the poison is in the
+  # syscall pair. BISECT3 (dispatcher install ON, hook manager OFF,
+  # SELinux pair off) BOOTED - the sys_call_table patch / ni-slot search /
+  # symbol resolution are innocent; the poison is inside
+  # ksu_syscall_hook_manager_init. Review of that function: the hook
+  # registrations are inert table writes, the sucompat/setuid/umount
+  # inits only register feature handlers, and the dispatcher itself is
+  # well guarded against spurious/self calls. Two heavy pieces remain:
+  # (A) the kretprobes on syscall_regfunc/syscall_unregfunc with the
+  # tp_marker process-marking inside their handlers, and (C) the
+  # sys_enter tracepoint whose handler redirects execve & friends into
+  # the dispatcher at runtime.
+  # BISECT4: manager fully ON but the sys_enter tracepoint registration
+  # is skipped (handler never fires, no redirection happens); SELinux
+  # pair still OFF. Boots -> (C) the redirect execution chain is the
+  # killer. Hangs -> (A) the kretprobe/tp_marker machinery is.
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
-  if ! grep -q 'bisect3-off' "$INIT_C"; then
-    python3 - "$INIT_C" <<'PYEOF'
+  MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
+  if ! grep -q 'bisect4-off' "$INIT_C"; then
+    python3 - "$INIT_C" "$MGR_C" <<'PYEOF'
 import sys
-path = sys.argv[1]
-src = open(path).read()
+init_path, mgr_path = sys.argv[1], sys.argv[2]
 
-def rep(old, new, expect=1):
-    global src
+def rep(src, old, new, expect=1):
     n = src.count(old)
     if n != expect:
-        print(f"ERROR: init.c: expected {expect} match, found {n} for {old[:50]!r}", file=sys.stderr)
+        print(f"ERROR: expected {expect} match, found {n} for {old[:50]!r}", file=sys.stderr)
         sys.exit(1)
-    src = src.replace(old, new)
+    return src.replace(old, new)
 
-rep("    ksu_selinux_hide_init();",
-    "    /* bisect3-off: ksu_selinux_hide_init(); */")
-rep("    ksu_avc_spoof_init();",
-    "    /* bisect3-off: ksu_avc_spoof_init(); */")
-rep("        ksu_syscall_hook_manager_init();",
-    "        /* bisect3-off: ksu_syscall_hook_manager_init(); */", 2)
+src = open(init_path).read()
+src = rep(src, "    ksu_selinux_hide_init();",
+    "    /* bisect4-off: ksu_selinux_hide_init(); */")
+src = rep(src, "    ksu_avc_spoof_init();",
+    "    /* bisect4-off: ksu_avc_spoof_init(); */")
+open(init_path, "w").write(src)
 
-open(path, "w").write(src)
-print("patched: core/init.c bisect3 manager+selinux off, dispatcher install on")
+src = open(mgr_path).read()
+src = rep(src, "    ret = register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN);",
+    "    ret = 0; /* bisect4-off: register_trace_prio_sys_enter skipped */")
+open(mgr_path, "w").write(src)
+print("patched: bisect4 - manager on, sys_enter tp skipped, selinux pair off")
 PYEOF
   fi
 fi
