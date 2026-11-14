@@ -97,6 +97,10 @@ clang --version | head -2
 # ---------------------------------------------------------------- kernel source
 step "clone kernel ($KERNEL_BRANCH)"
 git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_URL" "$KSRC"
+# Pin the release string to exactly CONFIG_LOCALVERSION: without this the
+# SCM version helper appends a '+' for the (FinaSU-extended) dirty tree and
+# the kernel reports 5.4.302-inkypen-v2+ instead of 5.4.302-inkypen-v2.
+: > "$KSRC/.scmversion"
 
 MAKE_ARGS=(
   -C "$KSRC" O="$WORK/kout" ARCH=arm64
@@ -877,6 +881,24 @@ cp "$CFG" "$OUT/kernel.config"
 grep -o '"[^"]*"' "$WORK/kout/include/generated/utsrelease.h" | head -1 | tr -d '"' \
   > "$OUT/utsrelease.txt" || true
 ( cd "$OUT" && sha256sum Image > SHA256SUMS )
+
+# Package an AnyKernel3 zip next to the raw Image so the kernel can be
+# flashed on-device (e.g. Horizon Kernel Flasher), no PC needed. Template:
+# osm0sis/AnyKernel3 pinned by commit; our anykernel.sh in scripts/ak3/.
+if [ "$VARIANT" != "vanilla" ]; then
+  step "package AnyKernel3 zip"
+  AK3_DIR="$WORK/ak3"
+  mkdir -p "$AK3_DIR"
+  git -C "$AK3_DIR" init -q
+  git -C "$AK3_DIR" remote add origin https://github.com/osm0sis/AnyKernel3
+  git -C "$AK3_DIR" fetch -q --depth 1 origin 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+  git -C "$AK3_DIR" checkout -q FETCH_HEAD
+  rm -rf "$AK3_DIR/.git" "$AK3_DIR/.github"
+  cp "$ROOT/scripts/ak3/anykernel.sh" "$AK3_DIR/anykernel.sh"
+  cp "$OUT/Image" "$AK3_DIR/Image"
+  ( cd "$AK3_DIR" && zip -r -q "$OUT/odin-${VARIANT}-ak3.zip" . )
+  ls -lh "$OUT/odin-${VARIANT}-ak3.zip"
+fi
 cat "$OUT/utsrelease.txt" || true
 ls -lh "$OUT"
 step "done"
