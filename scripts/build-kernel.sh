@@ -415,6 +415,9 @@ extern struct static_key_true ksu_su_compat_enabled;
 extern bool __ksu_is_allow_uid_for_current(uid_t uid);
 extern bool susfs_is_current_proc_no_su(void);
 extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
+/* 5.4 declares filename_lookup only in fs/internal.h, which this
+ * file does not include; declare it with its namei.c prototype. */
+extern int filename_lookup(int dfd, struct filename *name, unsigned flags, struct path *path, struct path *root);
 #endif
 
 """)
@@ -452,7 +455,9 @@ orig_flow:
 # ---------------------------------------------------------------- stat.c
 def wire_stat(path):
     lines = load(path)
-    i = find(lines, "int vfs_statx(int dfd, const char __user *filename, int flags,")
+    # The extern block must precede vfs_statx_fd (the first user of
+    # these symbols), which sits ABOVE vfs_statx in this file.
+    i = find(lines, "int vfs_statx_fd(unsigned int fd, struct kstat *stat,")
     insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
 extern struct static_key_true ksu_su_compat_enabled;
 extern struct static_key_true ksu_is_init_rc_hook_enabled;
@@ -460,6 +465,9 @@ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
 extern bool susfs_is_current_proc_no_su(void);
 extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
 extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+/* 5.4 declares filename_lookup only in fs/internal.h, which this
+ * file does not include; declare it with its namei.c prototype. */
+extern int filename_lookup(int dfd, struct filename *name, unsigned flags, struct path *path, struct path *root);
 #endif
 
 """)
