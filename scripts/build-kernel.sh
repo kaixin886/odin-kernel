@@ -985,10 +985,11 @@ PYEOF
   EXT_C="$KSRC/drivers/kernelsu/extension/susfs.c"
   PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
+  OPEN_C="$KSRC/fs/open.c"
   if ! grep -q 'susfs-wired' "$EXT_C"; then
-    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" <<'PYEOF'
+    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" "$OPEN_C" <<'PYEOF'
 import sys
-def_path, ext_path, pre_path, mgr_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+def_path, ext_path, pre_path, mgr_path, open_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 def rep(src, old, new, expect=1):
     n = src.count(old)
@@ -1024,6 +1025,15 @@ void susfs_set_current_proc_umounted_for_zygote_next(void)
 }
 """
 open(ext_path, "w").write(src)
+
+# Inkypen's susfs import forgot the header in fs/open.c: it calls
+# SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK (defined in
+# susfs_def.h) but never includes it - every other patched file in
+# the branch does. First SUSFS build died on this at fs/open.o.
+src = open(open_path).read()
+src = rep(src, "#include <linux/fs.h>",
+    "#include <linux/fs.h>\n#include <linux/susfs_def.h>  /* susfs-wired: open.c uses SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK */")
+open(open_path, "w").write(src)
 
 src = open(pre_path).read()
 old_sig = """bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
