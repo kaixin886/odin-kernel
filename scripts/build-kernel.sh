@@ -2,9 +2,10 @@
 # odin kernel CI builder.
 #
 # Environment inputs:
-#   VARIANT     vanilla | finasu | finasu-susfs   (default: vanilla)
+#   VARIANT     vanilla | finasu | finasu-susfs | resukisu   (default: vanilla)
 #   OPTS        off | smooth | battery            (default: off) config layer
 #   FINASU_REF  FinaSU git tag to integrate       (default: v1.3.2)
+#   BAKASU_REF  BakaSU (ReSukiSU) commit to integrate (default: pinned below)
 #
 # Outputs land in ./out : Image, .config, utsrelease.txt, SHA256SUMS.
 set -euo pipefail
@@ -12,6 +13,7 @@ set -euo pipefail
 VARIANT="${VARIANT:-vanilla}"
 OPTS="${OPTS:-off}"
 FINASU_REF="${FINASU_REF:-v1.3.2}"
+BAKASU_REF="${BAKASU_REF:-548d1dda060ca198823d8808804d01f5209ef4a9}"
 
 # Backwards-compatible aliases for the old boolean switch.
 case "$OPTS" in
@@ -28,7 +30,7 @@ mkdir -p "$WORK" "$OUT"
 
 KERNEL_URL="https://github.com/Inkypen79/kernel_xiaomi_odin.git"
 KERNEL_BRANCH="lineage-24.0"
-if [ "$VARIANT" = "finasu-susfs" ]; then
+if [ "$VARIANT" = "finasu-susfs" ] || [ "$VARIANT" = "resukisu" ]; then
   # Inkypen's susfs branch is lineage-24.0 + his susfs v2.1.0 import.
   KERNEL_BRANCH="susfs"
 fi
@@ -37,7 +39,7 @@ CLANG_WANT="clang-r574158"
 
 step() { echo; echo "===== $* ====="; }
 
-step "inputs: VARIANT=$VARIANT OPTS=$OPTS FINASU_REF=$FINASU_REF"
+step "inputs: VARIANT=$VARIANT OPTS=$OPTS FINASU_REF=$FINASU_REF BAKASU_REF=$BAKASU_REF"
 
 # ---------------------------------------------------------------- deps
 step "install host dependencies"
@@ -176,7 +178,433 @@ for a in rel.get("assets", []):
   EXTRA_MAKE_VARS+=(KSU_EXPECTED_SIZE="$KSU_SIZE" KSU_EXPECTED_HASH="$KSU_HASH" KSU_REQUIRE_PREINIT=1)
 fi
 
-if [ "$VARIANT" != "vanilla" ]; then
+
+# ---------------------------------------------------------------- BakaSU
+if [ "$VARIANT" = "resukisu" ]; then
+  step "integrate BakaSU (ReSukiSU) $BAKASU_REF"
+  # BakaSU is ReSukiSU renamed (github.com/Baka-SU/BakaSU). Its own
+  # setup.sh clones the repo into ./KernelSU (its Kbuild requires the
+  # .git directory to be present) and links drivers/kernelsu. Fetch
+  # setup.sh at the pinned commit so the integration is reproducible.
+  # No manager-cert extraction: BakaSU ships the expected certs of
+  # its supported managers built in (multi-manager is the default).
+  curl -fsSL "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_REF/kernel/setup.sh" \
+    -o "$WORK/bakasu-setup.sh"
+  ( cd "$KSRC" && bash "$WORK/bakasu-setup.sh" "$BAKASU_REF" )
+  test -d "$KSRC/KernelSU/.git"
+  test -e "$KSRC/fs/susfs.c"
+  grep -q 'SUSFS_VERSION "v2.1.0"' "$KSRC/include/linux/susfs.h"
+  echo "BakaSU integrated on susfs v2.1.0 base"
+
+  step "wire BakaSU SUSFS inline hooks + v2.1.0 glue"
+  # KSU_SUSFS is the SUSFS inline-hook configuration: the kernel side
+  # must carry the seven call sites from upstream susfs's 50_add_susfs
+  # patch (setresuid, execve, faccessat, stat, sys_read, sys_reboot,
+  # input), adapted to this 5.4 tree's shapes - execve's
+  # do_execveat_common is a one-line wrapper here, so the pre/post
+  # handling folds into it, and vfs_fstat is an inline over
+  # vfs_statx_fd, so the initrc size-spoof hook lands there. BakaSU's
+  # own inline_hook_check.mk greps for exactly these handler names.
+  # Inkypen's susfs is v2.1.0 while BakaSU tracks the latest susfs:
+  # the per-task no_su family is missing, so declare it in the
+  # kernel's susfs_def.h (where upstream v2.2+ declares it) and
+  # define degraded stubs in BakaSU's compat layer - the same
+  # collapse shape the FinaSU line used.
+  python3 - \
+    "$KSRC/drivers/kernelsu/compat/kernel_compat.c" \
+    "$KSRC/include/linux/susfs_def.h" \
+    "$KSRC/kernel/sys.c" \
+    "$KSRC/fs/exec.c" \
+    "$KSRC/fs/open.c" \
+    "$KSRC/fs/stat.c" \
+    "$KSRC/fs/read_write.c" \
+    "$KSRC/kernel/reboot.c" \
+    "$KSRC/drivers/input/input.c" <<'PYEOF'
+import re, sys
+
+# Line-surgery helpers: anchors are distinctive substrings; the file's own
+# bytes provide context lines, so no literal-whitespace fragility.
+def load(p):
+    return open(p).read().splitlines(keepends=True)
+
+def save(p, lines):
+    open(p, "w").writelines(lines)
+
+def find(lines, sub, expect=1, start=0):
+    hits = [i for i in range(start, len(lines)) if sub in lines[i]]
+    if len(hits) != expect:
+        print(f"ERROR: anchor {sub[:60]!r}: expected {expect}, found {len(hits)}", file=sys.stderr)
+        sys.exit(1)
+    return hits[0] if expect == 1 else hits
+
+def find_first(lines, sub, start=0):
+    for i in range(start, len(lines)):
+        if sub in lines[i]:
+            return i
+    print(f"ERROR: anchor {sub[:60]!r}: not found from line {start}", file=sys.stderr)
+    sys.exit(1)
+
+def insert_before(lines, idx, text):
+    lines[idx:idx] = [text]
+
+def insert_after(lines, idx, text):
+    lines[idx + 1:idx + 1] = [text]
+
+GLUE_MARKER = "bakasu-wired"
+
+# ---------------------------------------------------------------- glue
+def wire_glue(path):
+    lines = load(path)
+    if any(GLUE_MARKER in l for l in lines):
+        print("glue: already wired")
+        return
+    lines.append("""
+#include <linux/susfs_def.h>
+
+/* bakasu-wired: susfs v2.1.0 glue. Inkypen's import predates the
+ * per-task no_su flag family and a few v2.2+ helpers BakaSU expects
+ * from the kernel-side susfs. Degraded semantics, same shape as the
+ * venus 5.4 collapse: no_su never sets, the zygote_next umount mark
+ * collapses onto the plain umounted mark (a static inline in
+ * susfs_def.h), and the sid pre-registration calls are no-ops
+ * (BakaSU's selinux layer caches sids itself). The umounted query
+ * itself needs no glue: v2.1.0 already provides it as a static
+ * inline in susfs_def.h. */
+bool susfs_is_current_proc_no_su(void)
+{
+    return false;
+}
+
+void susfs_set_current_proc_no_su(void)
+{
+}
+
+void susfs_clear_current_proc_no_su(void)
+{
+}
+
+void susfs_set_current_proc_umounted_for_zygote_next(void)
+{
+    susfs_set_current_proc_umounted();
+}
+
+void susfs_set_init_sid(void)
+{
+}
+
+void susfs_set_ksu_sid(void)
+{
+}
+
+void susfs_set_priv_app_sid(void)
+{
+}
+""")
+    save(path, lines)
+    print("glue: appended to kernel_compat.c")
+
+# ------------------------------------------------------- susfs_def.h
+def wire_susfs_def(path):
+    lines = load(path)
+    if any(GLUE_MARKER in l for l in lines):
+        print("susfs_def.h: already wired")
+        return
+    lines.append("""
+/* bakasu-wired: declarations for the glue above. Upstream susfs
+ * v2.2+ declares the no_su family in this header; v2.1.0 predates
+ * it, so declare here and define degraded stubs in the KernelSU
+ * compat layer (drivers/kernelsu/compat/kernel_compat.c). */
+bool susfs_is_current_proc_no_su(void);
+void susfs_set_current_proc_no_su(void);
+void susfs_clear_current_proc_no_su(void);
+void susfs_set_current_proc_umounted_for_zygote_next(void);
+""")
+    save(path, lines)
+    print("susfs_def.h: declarations appended")
+
+# ---------------------------------------------------------------- sys.c
+def wire_sys(path):
+    lines = load(path)
+    i = find(lines, "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif
+
+""")
+    j = find(lines, "kruid = make_kuid(ns, ruid);", start=i + 4)
+    insert_before(lines, j, """#ifdef CONFIG_KSU_SUSFS
+	(void)ksu_handle_setresuid(ruid, euid, suid);
+#endif
+
+""")
+    save(path, lines)
+    print("sys.c: setresuid site wired")
+
+# ---------------------------------------------------------------- exec.c
+def wire_exec(path):
+    lines = load(path)
+    i = find(lines, "static int do_execveat_common(int fd, struct filename *filename,")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_su_compat_enabled;
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+extern bool susfs_is_current_proc_no_su(void);
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags);
+extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags, int *retval);
+extern int ksu_setup_preinit_file(struct filename **filename_ptr, struct user_arg_ptr *argv_user);
+extern int ksu_preinit_handle_post_execveat(int *fd, struct filename **filename_ptr,
+			void *argv_user, void *envp_user,
+			int *flags, int *retval, int *preinit_fd);
+#endif
+
+""")
+    j = find(lines, "return __do_execve_file(fd, filename, argv, envp, flags, NULL);")
+    lines[j] = """#ifdef CONFIG_KSU_SUSFS
+	{
+		int ksu_retval;
+		bool is_su_session = false;
+		bool is_ksu_preinit_session = false;
+		int preinit_fd = 0;
+
+		if (filename && !IS_ERR(filename) &&
+		    likely(!susfs_is_current_proc_no_su())) {
+			if (static_branch_likely(&ksu_su_compat_enabled)) {
+				if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted))
+					is_su_session = !ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+				else
+					is_su_session = !ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+			}
+			if (unlikely(current->pid == 1) && !is_su_session &&
+			    (fd == AT_FDCWD || !(flags & AT_EMPTY_PATH))) {
+				preinit_fd = ksu_setup_preinit_file(&filename, &argv);
+				if (preinit_fd > 0)
+					is_ksu_preinit_session = true;
+			}
+		}
+		ksu_retval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+		if (unlikely(is_su_session))
+			(void)ksu_handle_post_execveat_sucompat(&fd, &filename, &argv, &envp, &flags, &ksu_retval);
+		if (unlikely(is_ksu_preinit_session) &&
+		    ksu_preinit_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &ksu_retval, &preinit_fd))
+			ksu_retval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+		return ksu_retval;
+	}
+#endif
+	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+"""
+    save(path, lines)
+    print("exec.c: execve site wired")
+
+# ---------------------------------------------------------------- open.c
+def wire_open(path):
+    src = "".join(load(path))
+    if "#include <linux/susfs_def.h>" not in src:
+        # Inkypen's import uses SUSFS_IS_INODE_OPEN_REDIRECT_* in this
+        # file but never includes the header that defines them.
+        lines = src.splitlines(keepends=True)
+        i = find(lines, "#include <linux/fs.h>")
+        insert_after(lines, i, "#include <linux/susfs_def.h>  /* bakasu-wired: open.c uses SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK */\n")
+        src = "".join(lines)
+    lines = src.splitlines(keepends=True)
+    i = find(lines, "long do_faccessat(int dfd, const char __user *filename, int mode)")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_su_compat_enabled;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern bool susfs_is_current_proc_no_su(void);
+extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
+#endif
+
+""")
+    j = find_first(lines, "unsigned int lookup_flags = LOOKUP_FOLLOW;", start=i)
+    insert_after(lines, j, """#ifdef CONFIG_KSU_SUSFS
+	struct filename *fname = NULL;
+#endif
+""")
+    k = find_first(lines, "res = user_path_at(dfd, filename, lookup_flags, &path);", start=j)
+    # the line above must be the retry: label
+    if "retry:" not in lines[k - 1]:
+        print("ERROR: open.c: user_path_at not preceded by retry:", file=sys.stderr)
+        sys.exit(1)
+    lines[k] = """#ifdef CONFIG_KSU_SUSFS
+	fname = getname_flags(filename, lookup_flags, NULL);
+	if (IS_ERR(fname)) {
+		res = PTR_ERR(fname);
+		goto out;
+	}
+	if (likely(susfs_is_current_proc_no_su()))
+		goto orig_flow;
+	if (static_branch_likely(&ksu_su_compat_enabled)) {
+		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+			ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
+	}
+orig_flow:
+	res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+#else
+	res = user_path_at(dfd, filename, lookup_flags, &path);
+#endif
+"""
+    save(path, lines)
+    print("open.c: faccessat site wired")
+
+# ---------------------------------------------------------------- stat.c
+def wire_stat(path):
+    lines = load(path)
+    i = find(lines, "int vfs_statx(int dfd, const char __user *filename, int flags,")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_su_compat_enabled;
+extern struct static_key_true ksu_is_init_rc_hook_enabled;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern bool susfs_is_current_proc_no_su(void);
+extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+#endif
+
+""")
+    j = find_first(lines, "unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;", start=i)
+    insert_after(lines, j, """#ifdef CONFIG_KSU_SUSFS
+	struct filename *fname = NULL;
+#endif
+""")
+    k = find_first(lines, "error = user_path_at(dfd, filename, lookup_flags, &path);", start=j)
+    if "retry:" not in lines[k - 1]:
+        print("ERROR: stat.c: user_path_at not preceded by retry:", file=sys.stderr)
+        sys.exit(1)
+    lines[k] = """#ifdef CONFIG_KSU_SUSFS
+	fname = getname_flags(filename, lookup_flags, NULL);
+	if (IS_ERR(fname)) {
+		error = PTR_ERR(fname);
+		goto out;
+	}
+	if (likely(susfs_is_current_proc_no_su()))
+		goto orig_flow;
+	if (static_branch_likely(&ksu_su_compat_enabled)) {
+		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+			ksu_handle_stat(&dfd, &fname, &flags);
+	}
+orig_flow:
+	error = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+#else
+	error = user_path_at(dfd, filename, lookup_flags, &path);
+#endif
+"""
+    # vfs_statx_fd: initrc size spoof companion hook
+    m = find(lines, "error = vfs_getattr(&f.file->f_path, stat,")
+    insert_after(lines, m + 1, """#ifdef CONFIG_KSU_SUSFS
+		if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+			ksu_handle_vfs_fstat(fd, &stat->size);
+#endif
+""")
+    save(path, lines)
+    print("stat.c: stat + vfs_fstat sites wired")
+
+# ---------------------------------------------------------------- read_write.c
+def wire_read_write(path):
+    lines = load(path)
+    i = find(lines, "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_is_init_rc_hook_enabled;
+extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+#endif
+
+""")
+    j = find(lines, "return ksys_read(fd, buf, count);", start=i)
+    insert_before(lines, j, """#ifdef CONFIG_KSU_SUSFS
+	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+		ksu_handle_sys_read(fd, &buf, &count);
+#endif
+""")
+    save(path, lines)
+    print("read_write.c: sys_read site wired")
+
+# ---------------------------------------------------------------- reboot.c
+def wire_reboot(path):
+    lines = load(path)
+    i = find(lines, "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+#endif
+
+""")
+    j = find(lines, "int ret = 0;", start=i)
+    insert_after(lines, j, """
+#ifdef CONFIG_KSU_SUSFS
+	ret = ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	if (ret) {
+		goto orig_flow;
+	}
+	return ret;
+orig_flow:
+#endif
+""")
+    save(path, lines)
+    print("reboot.c: sys_reboot site wired")
+
+# ---------------------------------------------------------------- input.c
+def wire_input(path):
+    lines = load(path)
+    i = find(lines, "static void input_handle_event(struct input_dev *dev,")
+    insert_before(lines, i, """#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_is_input_hook_enabled;
+extern __attribute__((cold)) int ksu_handle_input_handle_event(
+			unsigned int *type, unsigned int *code, int *value);
+#endif
+
+""")
+    j = find(lines, "int disposition = input_get_disposition(dev, type, code, &value);", start=i)
+    insert_after(lines, j, """
+#ifdef CONFIG_KSU_SUSFS
+	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
+		ksu_handle_input_handle_event(&type, &code, &value);
+#endif
+""")
+    save(path, lines)
+    print("input.c: input site wired")
+
+if __name__ == "__main__":
+    glue, susfs_def, sys_c, exec_c, open_c, stat_c, rw_c, reboot_c, input_c = sys.argv[1:10]
+    wire_glue(glue)
+    wire_susfs_def(susfs_def)
+    wire_sys(sys_c)
+    wire_exec(exec_c)
+    wire_open(open_c)
+    wire_stat(stat_c)
+    wire_read_write(rw_c)
+    wire_reboot(reboot_c)
+    wire_input(input_c)
+    print("all sites wired")
+PYEOF
+
+  step "export do_mount for BakaSU 5.4 compat"
+  # BakaSU's <5.9 path_mount() fallback (compat/kernel_compat.c) calls
+  # do_mount() directly; fs/namespace.c does not export it on 5.4.
+  # (Its path_umount() fallback goes through the syscall table, so
+  # ksys_umount needs no export.)
+  NS_C="$KSRC/fs/namespace.c"
+  if ! grep -q 'EXPORT_SYMBOL(do_mount)' "$NS_C"; then
+    python3 - "$NS_C" <<'PYEOF2'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+idx = src.find("long do_mount(const char *dev_name, const char __user *dir_name,")
+if idx < 0:
+    print("ERROR: namespace.c: do_mount definition not found", file=sys.stderr)
+    sys.exit(1)
+end = src.find("\n}\n", idx)
+if end < 0:
+    print("ERROR: namespace.c: end of do_mount definition not found", file=sys.stderr)
+    sys.exit(1)
+end += len("\n}\n")
+src = src[:end] + "EXPORT_SYMBOL(do_mount);\n" + src[end:]
+open(path, "w").write(src)
+print("patched: fs/namespace.c EXPORT_SYMBOL(do_mount) for BakaSU")
+PYEOF2
+  fi
+fi
+
+if [ "$VARIANT" = "finasu" ] || [ "$VARIANT" = "finasu-susfs" ]; then
   step "5.4 compatibility patches"
   # include/linux/pgtable.h exists only since 5.10; on 5.4 the definitions
   # live in asm/pgtable.h. sucompat.c uses no pgtable symbols (the include
@@ -1125,12 +1553,46 @@ new_ret = """#ifdef CONFIG_KSU_SUSFS
 		extern void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);
 
 		ksu_handle_execveat_ksud(filename->name, &argv);
+
+		/* Inline sucompat (round 5): app root rides on exec of
+		 * /system/bin/su, whose interception lived in the disabled
+		 * tp bridge - granted apps (MT, Termux) got nothing. Mirror
+		 * the bridge here: an allowlisted caller execing su gets
+		 * ksud as the new program (file exec, argv untouched), its
+		 * root profile applied first, and an su session fd
+		 * installed after a successful exec. __do_execve_file
+		 * consumes the ksud file reference via bprm. */
+		if (!strcmp(filename->name, "/system/bin/su")) {
+			extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+			extern int escape_with_root_profile(void);
+			extern int ksu_install_su_fd(void);
+			extern struct cred *ksu_cred;
+			const struct cred *old_cred;
+			struct file *ksud_file;
+			int ksu_ret;
+
+			if (__ksu_is_allow_uid_for_current(current_uid().val)) {
+				old_cred = override_creds(ksu_cred);
+				ksud_file = filp_open("/data/adb/ksud", O_PATH, 0);
+				revert_creds(old_cred);
+				if (!IS_ERR(ksud_file)) {
+					ksu_ret = escape_with_root_profile();
+					if (!ksu_ret) {
+						ksu_ret = __do_execve_file(AT_FDCWD, NULL, argv, envp, 0, ksud_file);
+						if (!ksu_ret)
+							ksu_install_su_fd();
+						return ksu_ret;
+					}
+					fput(ksud_file);
+				}
+			}
+		}
 	}
 #endif
 	return __do_execve_file(fd, filename, argv, envp, flags, NULL);"""
 src = rep(src, old_ret, new_ret)
 open(exec_path, "w").write(src)
-print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off, tp layer off, selinux pair off, inline setresuid+execve call sites")
+print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off, tp layer off, selinux pair off, inline setresuid+execve call sites, inline su exec")
 PYEOF
   fi
   fi
@@ -1144,11 +1606,11 @@ make "${MAKE_ARGS[@]}" odin_defconfig
 
 CFG="$WORK/kout/.config"
 if [ "$VARIANT" != "vanilla" ]; then
-  step "enable FinaSU config"
+  step "enable KSU config ($VARIANT)"
   "$KSRC/scripts/config" --file "$CFG" \
     --enable KSU --enable KPROBES --enable KALLSYMS_ALL \
     --enable EXT4_FS --enable HEADERS_INSTALL
-  if [ "$VARIANT" = "finasu-susfs" ]; then
+  if [ "$VARIANT" = "finasu-susfs" ] || [ "$VARIANT" = "resukisu" ]; then
     "$KSRC/scripts/config" --file "$CFG" --enable KSU_SUSFS
   fi
 fi
@@ -1167,6 +1629,18 @@ fi
 
 make "${MAKE_ARGS[@]}" olddefconfig
 grep -E '^CONFIG_(KSU|KSU_SUSFS|KPROBES|KALLSYMS_ALL|HZ|WQ_POWER_EFFICIENT_DEFAULT)=' "$CFG" || true
+
+if [ "$VARIANT" = "resukisu" ]; then
+  step "install UAPI headers into objtree (BakaSU preinit codegen)"
+  # The preinit runner is compiled against $(objtree)/usr/include;
+  # without linux/unistd.h there BakaSU disables preinit, and the
+  # inline execve site in fs/exec.c would call missing symbols.
+  # Install explicitly (with the full MAKE_ARGS) instead of relying
+  # on the codegen's in-parse sub-make fallback.
+  make "${MAKE_ARGS[@]}" headers_install
+  test -f "$WORK/kout/usr/include/linux/unistd.h"
+  echo "UAPI headers ready for preinit runner"
+fi
 
 # ---------------------------------------------------------------- build
 step "build Image"
