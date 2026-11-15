@@ -1608,6 +1608,36 @@ PYEOF
 
 fi
 
+# ---------------------------------------------------------------- rekernel
+# Re:Kernel in-tree integration (resukisu only; sources live in
+# prep-rekernel-opt/, see its REPORT.md). Legacy-netlink binder/signal/
+# network event reporting for NoActive, gated by CONFIG_REKERNEL.
+# Runtime switch: /sys/kernel/rekernel/enabled (default on).
+if [ "$VARIANT" = "resukisu" ]; then
+  step "integrate Re:Kernel (in-tree)"
+  cp -a "$ROOT/prep-rekernel-opt/drivers/rekernel" "$KSRC/drivers/rekernel"
+  (cd "$KSRC" && patch -p1 --no-backup-if-mismatch < "$ROOT/prep-rekernel-opt/patches/tree-callsites.patch")
+  grep -q 'rekernel_binder_transaction(reply, t, target_node, tr)' "$KSRC/drivers/android/binder.c" || { echo "FATAL: rekernel binder call site missing"; exit 1; }
+  grep -q 'rekernel_report(SIGNAL' "$KSRC/kernel/signal.c" || { echo "FATAL: rekernel signal call site missing"; exit 1; }
+  grep -q 'source "drivers/rekernel/Kconfig"' "$KSRC/drivers/Kconfig" || { echo "FATAL: rekernel Kconfig wiring missing"; exit 1; }
+  grep -q 'obj-$(CONFIG_REKERNEL)' "$KSRC/drivers/Makefile" || { echo "FATAL: rekernel Makefile wiring missing"; exit 1; }
+
+  # Boeffla generic wakelock blocker v1.1.0 (andip71; source copy from
+  # the blu_spark lineage, see drivers/wakelock-blocker/SOURCE.md).
+  # The compiled-in default list is EMPTY on purpose: with no names in
+  # either sysfs list the wakeup.c hook is a no-op, so behaviour is
+  # identical to the current kernel. Names are a runtime decision for
+  # a later round, after on-device wakeup_sources evidence - the grep
+  # below fails the build if the default list ever gets pre-filled.
+  step "integrate Boeffla wakelock blocker (in-tree, empty list)"
+  cp -a "$ROOT/prep-rekernel-opt/drivers/wakelock-blocker" "$KSRC/drivers/wakelock-blocker"
+  (cd "$KSRC" && patch -p1 --no-backup-if-mismatch < "$ROOT/prep-rekernel-opt/patches/wakelock-blocker-callsites.patch")
+  grep -q 'check_for_block(ws)' "$KSRC/drivers/base/power/wakeup.c" || { echo "FATAL: wakelock blocker hook missing in wakeup.c"; exit 1; }
+  grep -q 'source "drivers/wakelock-blocker/Kconfig"' "$KSRC/drivers/Kconfig" || { echo "FATAL: wakelock blocker Kconfig wiring missing"; exit 1; }
+  grep -q 'obj-$(CONFIG_BOEFFLA_WL_BLOCKER)' "$KSRC/drivers/Makefile" || { echo "FATAL: wakelock blocker Makefile wiring missing"; exit 1; }
+  grep -q 'define LIST_WL_DEFAULT.*""' "$KSRC/drivers/wakelock-blocker/boeffla_wl_blocker.h" || { echo "FATAL: wakelock blocker default list is not empty"; exit 1; }
+fi
+
 # ---------------------------------------------------------------- config
 step "configure (odin_defconfig)"
 make "${MAKE_ARGS[@]}" odin_defconfig
@@ -1621,22 +1651,90 @@ if [ "$VARIANT" != "vanilla" ]; then
   if [ "$VARIANT" = "finasu-susfs" ] || [ "$VARIANT" = "resukisu" ]; then
     "$KSRC/scripts/config" --file "$CFG" --enable KSU_SUSFS
   fi
+  if [ "$VARIANT" = "resukisu" ]; then
+    "$KSRC/scripts/config" --file "$CFG" --enable REKERNEL --enable REKERNEL_NETWORK --enable BOEFFLA_WL_BLOCKER
+  fi
 fi
 
+# NOTE: the smooth layer is deprecated (user direction 2026-11-15: one
+# dynamic package instead of static smooth/battery tiers). The code is
+# kept for possible A/B experiments; it is not built this round.
 if [ "$OPTS" = "smooth" ]; then
-  step "apply smoothness config layer"
+  step "apply smoothness config layer (deprecated)"
   "$KSRC/scripts/config" --file "$CFG" \
     --disable HZ_250 --enable HZ_1000 \
-    --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC
+    --enable TCP_CONG_ADVANCED \
+    --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC \
+    --enable IDLE_PAGE_TRACKING
 elif [ "$OPTS" = "battery" ]; then
-  step "apply battery config layer (tick stays at 250 Hz)"
+  # "battery" is only the workflow slot name; this layer is the DYNAMIC
+  # layer (user direction 2026-11-15, standby-first, single package).
+  # No static performance/battery split: light load idles down, heavy
+  # load ramps up. The mechanism is schedutil driven by WALT load
+  # signals (CONFIG_SCHED_WALT=y in this tree), so make schedutil the
+  # boot default - odin_defconfig ships DEFAULT_GOV_PERFORMANCE while
+  # GOV_SCHEDUTIL is already built. Runtime governor control stays
+  # with userspace (power HAL / Scene) on top of this floor.
+  # HZ is not touched: odin_defconfig is already HZ_250, and with
+  # NO_HZ_IDLE the tick is off when idle, so HZ is no standby lever.
+  # WQ_POWER_EFFICIENT_DEFAULT is already =y in odin_defconfig, so the
+  # old layer's line for it was a no-op and is dropped.
+  step "apply dynamic config layer (battery slot: schedutil default, standby-first)"
   "$KSRC/scripts/config" --file "$CFG" \
-    --enable WQ_POWER_EFFICIENT_DEFAULT \
-    --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC
+    --disable CPU_FREQ_DEFAULT_GOV_PERFORMANCE \
+    --enable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
+    --enable TCP_CONG_ADVANCED \
+    --enable TCP_CONG_BBR --enable DEFAULT_BBR --disable DEFAULT_CUBIC \
+    --enable IDLE_PAGE_TRACKING
+fi
+
+if [ "$OPTS" = "smooth" ] || [ "$OPTS" = "battery" ]; then
+  # RCU_NOCB_CPU is already =y in odin_defconfig, but in this 5.4 tree it
+  # stays inert until the rcu_nocbs boot parameter names the CPUs (there
+  # is no RCU_NOCB_CPU_DEFAULT_ALL here). Append it to the built-in
+  # cmdline instead (CMDLINE_EXTEND: bootloader args stay in front).
+  CUR_CMDLINE="$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "$CFG")"
+  case " $CUR_CMDLINE " in
+    *" rcu_nocbs="*) echo "cmdline already carries rcu_nocbs: $CUR_CMDLINE" ;;
+    *) "$KSRC/scripts/config" --file "$CFG" --set-str CMDLINE "$CUR_CMDLINE rcu_nocbs=0-7" ;;
+  esac
+fi
+
+if [ "$OPTS" = "smooth" ] || [ "$OPTS" = "battery" ]; then
+  ZRAM_COMP=lz4
+  step "zram default compressor -> $ZRAM_COMP (layer $OPTS)"
+  ZRAM_COMP="$ZRAM_COMP" python3 - "$KSRC/drivers/block/zram/zram_drv.c" <<'PYEOF'
+import os, sys
+p = sys.argv[1]
+comp = os.environ["ZRAM_COMP"]
+src = open(p).read()
+old = 'static const char *default_compressor = "lzo-rle";'
+assert old in src, "zram default_compressor line not found"
+src = src.replace(old, 'static const char *default_compressor = "%s";' % comp, 1)
+open(p, "w").write(src)
+print("zram default_compressor ->", comp)
+PYEOF
 fi
 
 make "${MAKE_ARGS[@]}" olddefconfig
 grep -E '^CONFIG_(KSU|KSU_SUSFS|KPROBES|KALLSYMS_ALL|HZ|WQ_POWER_EFFICIENT_DEFAULT)=' "$CFG" || true
+# Hard audit: settings that olddefconfig can silently drop must fail the
+# build instead of shipping a layer that is not what its name says.
+if [ "$VARIANT" = "resukisu" ]; then
+  grep -q '^CONFIG_REKERNEL=y' "$CFG" || { echo "FATAL: CONFIG_REKERNEL not set after olddefconfig"; exit 1; }
+  grep -q '^CONFIG_REKERNEL_NETWORK=y' "$CFG" || { echo "FATAL: CONFIG_REKERNEL_NETWORK not set after olddefconfig"; exit 1; }
+  grep -q '^CONFIG_BOEFFLA_WL_BLOCKER=y' "$CFG" || { echo "FATAL: CONFIG_BOEFFLA_WL_BLOCKER not set after olddefconfig"; exit 1; }
+fi
+if [ "$OPTS" = "battery" ]; then
+  grep -q '^CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y' "$CFG" || { echo "FATAL: schedutil not the default governor after olddefconfig (dynamic layer)"; exit 1; }
+  grep -q '^CONFIG_HZ=250' "$CFG" || { echo "FATAL: HZ drifted from 250 (dynamic layer)"; exit 1; }
+fi
+if [ "$OPTS" != "off" ]; then
+  grep -q '^CONFIG_TCP_CONG_BBR=y' "$CFG" || { echo "FATAL: TCP_CONG_BBR dropped after olddefconfig (layer $OPTS)"; exit 1; }
+  grep -q '^CONFIG_DEFAULT_BBR=y' "$CFG" || { echo "FATAL: DEFAULT_BBR dropped after olddefconfig (layer $OPTS)"; exit 1; }
+  grep -q '^CONFIG_IDLE_PAGE_TRACKING=y' "$CFG" || { echo "FATAL: IDLE_PAGE_TRACKING not set (layer $OPTS)"; exit 1; }
+  grep -q '^CONFIG_CMDLINE=".*rcu_nocbs=' "$CFG" || { echo "FATAL: rcu_nocbs missing from built-in cmdline (layer $OPTS)"; exit 1; }
+fi
 
 if [ "$VARIANT" = "resukisu" ]; then
   step "install UAPI headers into objtree (BakaSU preinit codegen)"
