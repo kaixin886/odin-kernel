@@ -987,10 +987,12 @@ PYEOF
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
   OPEN_C="$KSRC/fs/open.c"
   INIT_C="$KSRC/drivers/kernelsu/core/init.c"
+  SYS_C="$KSRC/kernel/sys.c"
+  EXEC_C="$KSRC/fs/exec.c"
   if ! grep -q 'susfs-wired' "$EXT_C"; then
-    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" "$OPEN_C" "$INIT_C" <<'PYEOF'
+    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" "$OPEN_C" "$INIT_C" "$SYS_C" "$EXEC_C" <<'PYEOF'
 import sys
-def_path, ext_path, pre_path, mgr_path, open_path, init_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+def_path, ext_path, pre_path, mgr_path, open_path, init_path, sys_path, exec_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
 
 def rep(src, old, new, expect=1):
     n = src.count(old)
@@ -1079,7 +1081,54 @@ src = rep(src, "    ksu_selinux_hide_init();",
 src = rep(src, "    ksu_avc_spoof_init();",
     "    /* susfs-wired: ksu_avc_spoof_init(); */")
 open(init_path, "w").write(src)
-print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off, tp layer off, selinux pair off")
+
+# Round 3 (2026-11-15): round 2 boots but the manager shows
+# "not supported" - with the tp layer off, two FinaSU paths never
+# fire because their only caller was the tp bridge, and Inkypen's
+# susfs branch has no inline call sites for them:
+#   - the manager fd (ksu_install_fd) is installed from the
+#     setresuid handler when zygote spawns the manager process;
+#   - ksud tracking (second_stage: apply rules, cache sids, set up
+#     the KSU cred) hangs off the execve bridge.
+# Wire both inline, mirroring the bridge's exact semantics.
+src = open(sys_path).read()
+old_tail = """	retval = security_task_fix_setuid(new, old, LSM_SETID_RES);
+	if (retval < 0)
+		goto error;
+
+	return commit_creds(new);"""
+new_tail = """	retval = security_task_fix_setuid(new, old, LSM_SETID_RES);
+	if (retval < 0)
+		goto error;
+
+#ifdef CONFIG_KSU_SUSFS
+	{
+		extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+		uid_t ksu_old_uid = old->uid.val;
+
+		retval = commit_creds(new);
+		if (!retval)
+			ksu_handle_setresuid(ksu_old_uid, current_uid().val, current_uid().val);
+		return retval;
+	}
+#endif
+	return commit_creds(new);"""
+src = rep(src, old_tail, new_tail)
+open(sys_path, "w").write(src)
+
+src = open(exec_path).read()
+old_ret = "	return __do_execve_file(fd, filename, argv, envp, flags, NULL);"
+new_ret = """#ifdef CONFIG_KSU_SUSFS
+	if (filename) {
+		extern void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);
+
+		ksu_handle_execveat_ksud(filename->name, &argv);
+	}
+#endif
+	return __do_execve_file(fd, filename, argv, envp, flags, NULL);"""
+src = rep(src, old_ret, new_ret)
+open(exec_path, "w").write(src)
+print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off, tp layer off, selinux pair off, inline setresuid+execve call sites")
 PYEOF
   fi
   fi
