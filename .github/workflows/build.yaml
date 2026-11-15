@@ -10,6 +10,7 @@ on:
           - vanilla
           - finasu
           - finasu-susfs
+          - resukisu
         default: vanilla
       opts:
         description: "Config layer"
