@@ -986,10 +986,11 @@ PYEOF
   PRE_C="$KSRC/drivers/kernelsu/preinit/preinit.c"
   MGR_C="$KSRC/drivers/kernelsu/hook/syscall_hook_manager.c"
   OPEN_C="$KSRC/fs/open.c"
+  INIT_C="$KSRC/drivers/kernelsu/core/init.c"
   if ! grep -q 'susfs-wired' "$EXT_C"; then
-    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" "$OPEN_C" <<'PYEOF'
+    python3 - "$SUS_DEF" "$EXT_C" "$PRE_C" "$MGR_C" "$OPEN_C" "$INIT_C" <<'PYEOF'
 import sys
-def_path, ext_path, pre_path, mgr_path, open_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+def_path, ext_path, pre_path, mgr_path, open_path, init_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 
 def rep(src, old, new, expect=1):
     n = src.count(old)
@@ -1051,8 +1052,34 @@ src = rep(src, '    syscall_regfunc_rp = init_kretprobe("syscall_regfunc", sysca
     "    syscall_regfunc_rp = NULL; /* susfs-wired: kretprobe pair not registered */")
 src = rep(src, '    syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);',
     "    syscall_unregfunc_rp = NULL; /* susfs-wired: kretprobe pair not registered */")
+# The tp redirect is convicted on this tree (bisect10: even a pure
+# pass-through hook hangs the boot), and v1.3.2 registers it in
+# SUSFS mode too - the first SUSFS build hung the same way. Disable
+# the whole tp layer: no hook registrations, no tracepoint. The
+# susfs kernel-side hooks and the KSU core do not depend on it.
+src = rep(src, "    ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);",
+    "    /* susfs-wired: ksu_register_syscall_hook(__NR_execve, ksu_hook_execve); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat);",
+    "    /* susfs-wired: ksu_register_syscall_hook(__NR_execveat, ksu_hook_execveat); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat);",
+    "    /* susfs-wired: ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat); */")
+src = rep(src, "    ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);",
+    "    /* susfs-wired: ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat); */")
+src = rep(src, "    ret = register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN);",
+    "    ret = 0; /* susfs-wired: sys_enter tracepoint not registered on this tree */")
 open(mgr_path, "w").write(src)
-print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off")
+
+# The SELinux pair (our 5.4 selinux_hide port + avc spoof) has never
+# been exonerated on its own: every booting build so far had it off.
+# Keep it off for this round too; re-enable separately once the
+# SUSFS core is proven to boot.
+src = open(init_path).read()
+src = rep(src, "    ksu_selinux_hide_init();",
+    "    /* susfs-wired: ksu_selinux_hide_init(); */")
+src = rep(src, "    ksu_avc_spoof_init();",
+    "    /* susfs-wired: ksu_avc_spoof_init(); */")
+open(init_path, "w").write(src)
+print("patched: susfs wiring - glue stubs, preinit off, kretprobe pair off, tp layer off, selinux pair off")
 PYEOF
   fi
   fi
