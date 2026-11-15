@@ -1090,7 +1090,13 @@ open(init_path, "w").write(src)
 #     setresuid handler when zygote spawns the manager process;
 #   - ksud tracking (second_stage: apply rules, cache sids, set up
 #     the KSU cred) hangs off the execve bridge.
-# Wire both inline, mirroring the bridge's exact semantics.
+# Wire both inline. Note the setresuid handler's SUSFS branch reads
+# the RAW SYSCALL ARGS (zygote specialization calls
+# setresuid(app_uid, app_uid, app_uid), so ruid IS the new uid) and
+# must run BEFORE commit_creds while current is still in the zygote
+# domain - the tp bridge's post-call argument convention
+# (old_uid, current, current) silently no-ops here; round 3 proved
+# it (booted, manager still unsupported).
 src = open(sys_path).read()
 old_tail = """	retval = security_task_fix_setuid(new, old, LSM_SETID_RES);
 	if (retval < 0)
@@ -1104,12 +1110,8 @@ new_tail = """	retval = security_task_fix_setuid(new, old, LSM_SETID_RES);
 #ifdef CONFIG_KSU_SUSFS
 	{
 		extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
-		uid_t ksu_old_uid = old->uid.val;
 
-		retval = commit_creds(new);
-		if (!retval)
-			ksu_handle_setresuid(ksu_old_uid, current_uid().val, current_uid().val);
-		return retval;
+		ksu_handle_setresuid(ruid, euid, suid);
 	}
 #endif
 	return commit_creds(new);"""
