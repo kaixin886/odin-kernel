@@ -466,3 +466,6 @@ kernel/{time,rcu,power}/Kconfig，存本目录 `inspect/`。先说总判断：**
    `ls /sys/class/misc/boeffla_wakelock_blocker/` 四个节点齐全、
    `cat .../wakelock_blocker` 与 `.../wakelock_blocker_default` 均为空、
    `version` 显示 1.1.0——本轮不写任何名字。
+
+## 首轮构建修正（2026-11-16，run 43723961150）
+死因：tree-callsites 的 drivers/Kconfig、drivers/Makefile 两 hunk 锚在文件尾，但 CI 顺序里 BakaSU setup.sh 先行改尾（Kconfig 在 endmenu 前插入 kernelsu source 行、Makefile 尾部追加 KSU obj 行），裸树自验漏掉此副作用。修正：四处 hunk（rekernel＋wakelock 的 Kconfig/Makefile）全部按「BakaSU 改尾后」的真实状态重新生成，并按 CI 顺序全序模拟（裸树→BakaSU 改尾→两补丁→7 项 grep 审计）通过后推送。

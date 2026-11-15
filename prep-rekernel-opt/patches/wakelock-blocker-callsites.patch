@@ -99,8 +99,8 @@
  }
 --- a/drivers/Kconfig
 +++ b/drivers/Kconfig
-@@ -234,4 +234,6 @@
- 
+@@ -235,4 +235,6 @@
+ source "drivers/kernelsu/Kconfig"
  source "drivers/rekernel/Kconfig"
  
 +source "drivers/wakelock-blocker/Kconfig"
@@ -108,8 +108,8 @@
  endmenu
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -188,3 +188,4 @@
- obj-$(CONFIG_COUNTER)		+= counter/
- obj-$(CONFIG_NXP_SR100)         += uwb-sr100/
+@@ -190,3 +190,4 @@
+ 
+ obj-$(CONFIG_KSU) += kernelsu/
  obj-$(CONFIG_REKERNEL)		+= rekernel/
 +obj-$(CONFIG_BOEFFLA_WL_BLOCKER) += wakelock-blocker/
